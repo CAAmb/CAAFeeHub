@@ -338,6 +338,7 @@ td input.num{text-align:right}
 .banner.info{background:var(--info-bg);border-color:var(--info-line);color:var(--info-fg)}
 .banner.warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-fg)}
 .banner.bad{background:var(--bad-bg);border-color:var(--bad-line);color:var(--bad-fg)}
+.banner.ok{background:var(--ok-bg);border-color:var(--ok-line);color:var(--ok-fg)}
 .banner code{background:var(--mute-bg);padding:1px 5px;border-radius:4px}
 
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
@@ -422,6 +423,29 @@ td input.num{text-align:right}
   .quote-grid .q + .q{border-left:0;padding-left:0}
 }
 @media print{.quote-head{position:static;box-shadow:none}}
+
+/* An index across the top of a long screen. Each tile opens its section and
+   scrolls to it; a tile carrying a warning is the reason to look at all. */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;margin-bottom:18px}
+.tile{display:block;width:100%;text-align:left;font-family:inherit;cursor:pointer;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);
+  padding:10px 13px;box-shadow:var(--shadow)}
+.tile:hover{border-color:var(--line-strong);background:var(--surface-2)}
+.tile .t{display:block;font-size:.8rem;font-weight:600;color:var(--ink)}
+.tile .n{display:block;font-size:.7rem;color:var(--ink-muted);margin-top:2px;min-height:1em}
+.tile.warn{border-color:var(--warn-line);background:var(--warn-bg)}
+.tile.warn .t,.tile.warn .n{color:var(--warn-fg)}
+.tile.bad{border-color:var(--bad-line);background:var(--bad-bg)}
+.tile.bad .t,.tile.bad .n{color:var(--bad-fg)}
+/* Context rather than an exception, so it opens nothing and does not invite a
+   click it cannot answer. */
+.tile.static{cursor:default;background:var(--surface-2);box-shadow:none}
+.tile.static .t{color:var(--ink-2)}
+.card.rcs{margin-bottom:12px}
+/* Briefly rings the section a tile jumped to, so the eye lands in the right
+   place on a screen of near-identical headers. */
+@keyframes jumped{from{box-shadow:0 0 0 3px var(--focus-ring)}to{box-shadow:var(--shadow)}}
+.card.jumped{animation:jumped 1.1s ease-out}
 
 /* The inputs that move nearly every figure, together at the top. */
 .keys{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);
@@ -1116,6 +1140,11 @@ const state = {
      the signed-in account against the Adviser Directory and is not selectable;
      here it is a picker so the whole flow can be demonstrated. */
   asAdviser: null,
+  /* Settings and Exceptions both hold more than fits on a screen, so their
+     blocks fold. Keyed by section; anything absent is closed. */
+  rcTab: "review",        // Rate/Fee Settings: "review" | "pricing"
+  rcOpen: {},
+  exOpen: {},
   navCollapsed: null,     // null = follow the viewport, true/false = pinned by the user
   theme: "system",        // "system" | "light" | "dark"
   /* Set once by resolveIdentity(). Null in local mode, and null while a
@@ -3816,7 +3845,9 @@ function viewMyClients() {
     stat("Total FUM", money(totFum), "included accounts only") +
     stat("Current fees", money(totCur), "what they pay today") +
     stat("New fees", money(totNew), money(totNew - totCur) + " movement") +
-    (noRate ? stat("Awaiting a rate", noRate, "head office is setting these", "warn") : "") +
+    /* Priced centrally before a month opens, so an adviser seeing this means it
+       was missed rather than that it is in hand. */
+    (noRate ? stat("Awaiting a rate", noRate, "notify admin", "warn") : "") +
     "</div>";
 
   if (!locked) {
@@ -3908,7 +3939,8 @@ function clientTable(list, locked) {
       (showAdviser ? "<td>" + esc(m.adviser) + '<div class="small muted">' + esc(m.region) + "</div></td>" : "") +
       "<td>" + esc(m.category || "—") +
         (m.mappedTo ? '<div class="small muted">prices as ' + esc(m.mappedTo) + "</div>" : "") +
-        (m.baseFee == null ? ' <span class="pill bad">no rate</span>' : "") + "</td>" +
+        (m.baseFee == null ? ' <span class="pill bad" title="This category has no price on the rate card. ' +
+          'It should have been set before the month opened — notify admin rather than pricing round it.">no rate</span>' : "") + "</td>" +
       '<td class="num">' + money(m.totalFum) + "</td>" +
       '<td class="num">' + money(m.currentFee) + "</td>" +
       '<td class="num">' + money(m.rateCardFee) +
@@ -4154,7 +4186,12 @@ function feeCell(m, locked) {
     (m.fee == null ? "" : Math.round(m.fee)) + '"' + (disabled ? " disabled" : "") + ">" +
     (m.mode === "Percentage" ? '<div class="small muted">from the %</div>'
       : m.feeEdited ? '<div class="small muted">adjusted</div>'
-      : m.baseFee == null ? '<div class="small muted">no rate &mdash; type one</div>' : "") +
+      /* Categories are priced before a month opens, so an adviser meeting this
+         means it was missed. Pricing round it closes the client and hides the
+         gap, so it asks them to report it instead — but the box stays editable,
+         because blocked is worse than discouraged and the flag reaches the
+         manager at approval either way. */
+      : m.baseFee == null ? '<div class="small muted">no rate &mdash; notify admin</div>' : "") +
     /* One fund over its cap caps the whole client fee, because the fee is split
        across the funds by weight. So the fix is here, not on the fund. */
     (m.overCap && m.maxFee != null && !locked
@@ -4173,193 +4210,240 @@ function pctCell(m, locked) {
 }
 
 /* ---------------- Exceptions ---------------- */
+/* One folding block on Exceptions. A section holding a genuine error opens
+   itself; a warning, or a section with nothing in it, stays shut with its count
+   on the header. */
+function exceptionSection(s) {
+  const clear = !s.count;
+  return foldShell({
+    id: "exs-" + s.key, attr: "data-exfold", key: s.key, title: s.title, sub: s.sub,
+    open: state.exOpen[s.key] === undefined ? (s.tone === "bad" && !clear) : !!state.exOpen[s.key],
+    badge: clear ? '<span class="pill ok">clear</span>'
+                 : '<span class="pill ' + (s.tone === "bad" ? "bad" : "warn") + '">' +
+                   s.count.toLocaleString("en-AU") + "</span>",
+    actions: s.actions, body: s.body
+  });
+}
+
+/* The index across the top. Built from the same list as the sections, so a tile
+   and the thing it jumps to cannot drift apart. */
+function exceptionTiles(sections, extras) {
+  return '<div class="tiles no-print">' +
+    sections.map(s => {
+      const tone = !s.count ? "" : s.tone === "bad" ? " bad" : " warn";
+      return '<button class="tile' + tone + '" data-exjump="' + s.key + '">' +
+        '<span class="t">' + esc(s.tile || s.title) + "</span>" +
+        '<span class="n">' + (s.count ? s.count.toLocaleString("en-AU") + " · " + esc(s.note || "") : "clear") +
+        "</span></button>";
+    }).join("") +
+    /* Two figures with nothing to open — context, not exceptions. */
+    extras.map(x => '<div class="tile static"><span class="t">' + esc(x.t) + "</span>" +
+      '<span class="n">' + esc(x.v + " · " + x.n) + "</span></div>").join("") +
+    "</div>";
+}
+
 function viewExceptions() {
   const c = state.calc;
   if (!c) return '<div class="banner warn">Load a run first.</div>';
 
-  let html = "";
+  const rc = state.rateCard;
   const totalUnpriced = c.unpricedCats.reduce((a, x) => a + x[1], 0);
-
-  html += '<div class="stats">' +
-    stat("Unpriced clients", totalUnpriced.toLocaleString("en-AU"), c.unpricedCats.length + " categories", totalUnpriced ? "bad" : "") +
-    stat("Codes to confirm", c.ambiguous.length, "letter changed meaning", c.ambiguous.length ? "warn" : "") +
-    stat("Unknown advisers", c.unknownAdvisers.length, "not in the directory", c.unknownAdvisers.length ? "warn" : "") +
-    stat("Excluded rows", c.droppedRows.toLocaleString("en-AU"), "zero value or no platform") +
-    stat("Off band", c.masters.filter(m => m.outsideBand).length, "more than " + (state.rateCard.variancePct * 100) + "% from rate card", c.masters.some(m => m.outsideBand) ? "warn" : "") +
-    stat("Below current fee", c.masters.filter(m => m.belowCurrent).length, "breaks the never-decrease rule", c.masters.some(m => m.belowCurrent) ? "bad" : "") +
-    stat("Over a platform cap", c.overCap.length, "more than the platform allows", c.overCap.length ? "bad" : "") +
-    stat("Under a platform minimum", c.underMinBalance.length, "fee would not be drawn", c.underMinBalance.length ? "bad" : "") +
-    stat("Needing a direct debit", c.needSplit.length, "platform can't carry the fee", c.needSplit.length ? "warn" : "") +
-    stat("Platforms with no cap set", c.unknownFunds.length, "not in the fund table", c.unknownFunds.length ? "warn" : "") +
-    stat("Funds with no fee type", c.unsetFundClients.reduce((a, m) => a + m.unsetFunds, 0),
-      "on " + c.unsetFundClients.length + " clients priced by fund", c.unsetFundClients.length ? "warn" : "") +
-    stat("Payment shortfalls", c.paymentShortfalls.length, "drawn less than the fee", c.paymentShortfalls.length ? "bad" : "") +
-    stat("Hidden placeholders", c.hiddenDefaults.toLocaleString("en-AU"),
-      state.showEmptyDefaults ? "showing — see Settings" : 'empty "Default" accounts') +
-    "</div>";
-
-  html += '<div class="grid2"><div class="card"><div class="card-h"><h2>Clients priced by fund with funds not set</h2>' +
-    '<div class="sub">A fund with no fee type charges nothing, so the client total is understated.</div></div><div class="card-b">' +
-    (c.unsetFundClients.length
-      ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Funds unset</th><th class="num">Charging</th></tr></thead><tbody>' +
-        c.unsetFundClients.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) +
-          '</td><td class="num">' + m.unsetFunds + " of " + m.rows.filter(r => r.included).length +
-          '</td><td class="num">' + money(m.fee) + "</td></tr>").join("") + "</tbody></table>"
-      : '<div class="muted">Every fund on every client priced by fund has a fee type.</div>') +
-    "</div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>Payment shortfalls</h2>' +
-    '<div class="sub">Fund amounts add up to less than the client\'s fee.</div></div><div class="card-b">' +
-    (c.paymentShortfalls.length
-      ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Fee</th><th class="num">Allocated</th><th class="num">Short</th></tr></thead><tbody>' +
-        c.paymentShortfalls.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) +
-          '</td><td class="num">' + money(m.fee) + '</td><td class="num">' + money(m.collected) +
-          '</td><td class="num">' + money(m.paymentGap) + "</td></tr>").join("") + "</tbody></table>"
-      : '<div class="muted">Every client with split payments reconciles to its fee.</div>') +
-    "</div></div></div><div class=\"spacer\"></div>";
-
-  if (c.ambiguous.length) {
-    html += '<div class="card"><div class="card-h"><h2>Category codes worth confirming</h2>' +
-      '<div class="sub">Priced by name match, but the same code meant a different tier on the old table</div></div><div class="card-b">' +
-      '<table><thead><tr><th>Xplan category</th><th class="num">Clients</th><th class="num">Old table</th><th class="num">Pricing at</th><th></th></tr></thead><tbody>' +
-      c.ambiguous.map(e => "<tr><td><strong>" + esc(e.category) + '</strong></td><td class="num">' + e.clients +
-        '</td><td class="num">' + money(state.rateCard.legacyRates[e.category]) + '</td><td class="num">' + money(e.rate) +
-        '</td><td>' + (can("rateCardEdit") ? '<button class="btn ghost btn-sm" data-addcat="' + esc(e.category) + '">Review mapping</button>' : "") + '</td></tr>').join("") +
-      "</tbody></table></div></div><div class=\"spacer\"></div>";
-  }
-
-  html += '<div class="card"><div class="card-h"><h2>Categories with no rate</h2>' +
-    '<div class="sub">These clients are calculated but not priced. Map each one to a tier and they flow straight through.</div></div><div class="card-b">';
-  html += c.unpricedCats.length
-    ? '<table><thead><tr><th>Master category</th><th class="num">Master clients</th><th class="num">Old table</th><th class="num">Current fees</th><th></th></tr></thead><tbody>' +
-      c.unpricedCats.map(([cat, n]) => {
-        const cur = c.masters.filter(m => (m.category || "(blank)") === cat).reduce((a, m) => a + (m.currentFee || 0), 0);
-        const legacy = state.rateCard.legacyRates[cat];
-        return "<tr><td><strong>" + esc(cat) + '</strong></td><td class="num">' + n + '</td><td class="num">' +
-          (legacy == null ? '<span class="muted">&mdash;</span>' : money(legacy)) + '</td><td class="num">' + money(cur) +
-          '</td><td>' + (can("rateCardEdit") ? '<button class="btn ghost btn-sm" data-addcat="' + esc(cat) + '">Map to a tier</button>' : "") + '</td></tr>';
-      }).join("") + "</tbody></table>"
-    : '<div class="muted">Every category in this run has a rate. Nothing to do.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>Advisers not in the directory</h2>' +
-    '<div class="sub">No region, and no one to send a report to.</div></div><div class="card-b">';
-  html += c.unknownAdvisers.length
-    ? '<table><thead><tr><th>Adviser</th><th class="num">Master clients</th><th></th></tr></thead><tbody>' +
-      c.unknownAdvisers.map(a => "<tr><td>" + esc(a) + '</td><td class="num">' + c.masters.filter(m => m.adviser === a).length +
-        '</td><td>' + (can("people") ? '<button class="btn ghost btn-sm" data-addadv="' + esc(a) + '">Add adviser</button>' : "") + '</td></tr>').join("") + "</tbody></table>"
-    : '<div class="muted">Every adviser in this run is in the directory.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
-
   const off = c.masters.filter(m => m.outsideBand);
-  html += '<div class="card"><div class="card-h"><h2>Fees outside the ' + (state.rateCard.variancePct * 100) + '% band</h2>' +
-    '<div class="sub">A warning only — advisers are not blocked from setting these.</div></div><div class="card-b">';
-  html += off.length
-    ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Rate card</th><th class="num">Adviser fee</th><th class="num">Difference</th></tr></thead><tbody>' +
-      off.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) + '</td><td class="num">' + money(m.rateCardFee) +
-        '</td><td class="num">' + money(m.fee) + '</td><td class="num">' + money(m.diffToCard) + "</td></tr>").join("") + "</tbody></table>"
-    : '<div class="muted">No fee sits outside the band.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
+  const below = c.masters.filter(m => m.belowCurrent);
+  const unsetTotal = c.unsetFundClients.reduce((a, m) => a + m.unsetFunds, 0);
 
-  /* Cap breaches are per account, so this lists accounts rather than clients —
-     the fund is where the number has to change. */
   const capRows = [];
   for (const m of c.overCap) for (const r of m.overCapFunds) capRows.push({ m, r });
-  html += '<div class="card"><div class="card-h"><h2>Over a platform fee cap</h2>' +
-    '<div class="sub">More than the platform will let us draw from the account. Not a Coastal rule &mdash; the fee will be ' +
-    "rejected or trimmed at their end.</div></div><div class=\"card-b\">";
-  html += capRows.length
-    ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Platform</th><th>Adviser</th>' +
-      '<th class="num">Balance</th><th class="num">Drawing</th><th class="num">Maximum</th><th class="num">Over by</th></tr></thead><tbody>' +
-      capRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
-        "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) + "</td>" +
-        "<td>" + esc(r.fund ? r.fund.name : "—") +
-          '<div class="small muted">' + (r.capBinding === "percentage" ? r.fund.capPct.toFixed(2) + "% of balance" : "flat cap") + "</div></td>" +
-        "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
-        '</td><td class="num">' + money(r.feeShare) + '</td><td class="num">' + money(r.capValue) +
-        '</td><td class="num">' + money(r.overCapBy) + "</td></tr>").join("") + "</tbody></table>"
-    : '<div class="muted">Every account is inside its platform\'s cap.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
-
   const minRows = [];
   for (const m of c.underMinBalance) for (const r of m.underMinBalance) minRows.push({ m, r });
-  html += '<div class="card"><div class="card-h"><h2>Under a platform minimum balance</h2>' +
-    '<div class="sub">The platform will not process an advice fee at all on a balance this small, so the fee simply ' +
-    "would not arrive.</div></div><div class=\"card-b\">";
-  html += minRows.length
-    ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Platform</th><th>Adviser</th>' +
-      '<th class="num">Balance</th><th class="num">Minimum</th><th class="num">Fee at risk</th></tr></thead><tbody>' +
-      minRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
-        "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) + "</td><td>" + esc(r.fund.name) + "</td>" +
-        "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
-        '</td><td class="num">' + money(r.fund.minBalance) + '</td><td class="num">' + money(r.feeShare) +
-        "</td></tr>").join("") + "</tbody></table>"
-    : '<div class="muted">No account is under its platform\'s minimum.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
-
-  /* The one on this screen that is a conversation rather than a correction. */
   const splitRows = [];
   for (const m of c.needSplit) for (const r of m.splitFunds) splitRows.push({ m, r });
-  html += '<div class="card"><div class="card-h"><h2>Fees needing a direct debit</h2>' +
-    '<div class="sub">Part of the fee cannot come off the platform, either because the platform will not allow it or ' +
-    "because our own draw limit will not. The adviser needs to raise it with the client.</div></div><div class=\"card-b\">";
-  if (state.rateCard.maxDrawPct > 0 && state.rateCard.absoluteMinimum > 0) {
-    html += '<div class="banner info" style="margin-bottom:14px">Our rule bites below <strong>' +
-      money(state.rateCard.absoluteMinimum / (state.rateCard.maxDrawPct / 100)) + "</strong> of FUM &mdash; the point where " +
-      state.rateCard.maxDrawPct + "% stops reaching the " + money(state.rateCard.absoluteMinimum) +
-      " minimum fee. Above that line only a platform's own cap or minimum can force a split.</div>";
-  }
-  html += splitRows.length
-    ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Adviser</th><th class="num">Balance</th>' +
-      '<th class="num">Fee</th><th class="num">Platform can take</th><th class="num">By direct debit</th><th>Why</th>' +
-      '<th class="num">FUM needed</th></tr></thead><tbody>' +
-      splitRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
-        "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) +
-          '<div class="small muted">' + esc(r.fund ? r.fund.name : "—") + "</div></td>" +
-        "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
-        '</td><td class="num">' + money(r.feeShare) +
-        '</td><td class="num">' + money(r.platformMax) +
-        '</td><td class="num"><strong>' + money(r.shortfall) + "</strong></td>" +
-        "<td>" + (r.limitedBy === "minimum balance"
-            ? "under the " + money(r.fund.minBalance) + " platform minimum"
-          : r.limitedBy === "house rule"
-            ? "our " + state.rateCard.maxDrawPct + "% draw limit"
-            : "over the " + money(r.capValue) + " platform cap") +
-          (r.limitedBy === "house rule" ? "" : '<div class="small muted">the platform\'s rule</div>') + "</td>" +
-        '<td class="num">' + (r.fumForFullFee == null ? '<span class="muted">&mdash;</span>' : money(r.fumForFullFee)) +
-        "</td></tr>").join("") + "</tbody></table>" +
-      '<div class="spacer"></div><div class="small muted"><strong>FUM needed</strong> is the balance this account would ' +
-      "have to hold for the platform to carry the whole fee on its own &mdash; the figure to quote if the answer is " +
-      "consolidating rather than a direct debit. Blank where the platform has a flat cap or a minimum balance, because " +
-      "no amount of FUM changes those.</div>"
-    : '<div class="muted">Every fee can be drawn in full from its platform.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
 
-  html += '<div class="card"><div class="card-h"><h2>Platforms with no cap recorded</h2>' +
-    '<div class="sub">In this run, but not in the fund table &mdash; so nothing is checked against them.</div>' +
-    (can("rateCardEdit") ? '<div class="right no-print"><button class="btn ghost btn-sm" id="btnGoFunds">Open Rate/Fee Settings</button></div>' : "") +
-    "</div><div class=\"card-b\">";
-  html += c.unknownFunds.length
-    ? '<table><thead><tr><th>Platform</th><th class="num">Accounts</th><th class="num">Balance</th><th class="num">Fees drawn</th></tr></thead><tbody>' +
-      c.unknownFunds.map(v => {
-        const rs = c.rows.filter(r => r.included && !r.fund && r.vendorUsed === v);
-        return "<tr><td><strong>" + esc(v) + '</strong></td><td class="num">' + rs.length +
-          '</td><td class="num">' + money(rs.reduce((a, r) => a + r.valueUsed, 0)) +
-          '</td><td class="num">' + money(rs.reduce((a, r) => a + (r.feeShare || 0), 0)) + "</td></tr>";
-      }).join("") + "</tbody></table>"
-    : '<div class="muted">Every platform in this run has an entry in the fund table.</div>';
-  html += "</div></div><div class=\"spacer\"></div>";
+  const none = msg => '<div class="muted">' + msg + "</div>";
 
-  const below = c.masters.filter(m => m.belowCurrent);
-  html += '<div class="card"><div class="card-h"><h2>Fees below the current fee</h2>' +
-    '<div class="sub">A percentage can multiply out under what the client pays today. The rate card fee cannot, so these are always adviser-set.</div></div><div class="card-b">';
-  html += below.length
-    ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Fee type</th><th class="num">Current fee</th><th class="num">Adviser fee</th><th class="num">Shortfall</th></tr></thead><tbody>' +
-      below.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) + "</td><td>" + esc(feeTypeLabel(m)) +
-        '</td><td class="num">' + money(m.currentFee) + '</td><td class="num">' + money(m.fee) +
-        '</td><td class="num">' + money(m.fee - m.currentFee) + "</td></tr>").join("") + "</tbody></table>"
-    : '<div class="muted">No fee falls below the current fee.</div>';
-  html += "</div></div>";
+  const sections = [
+    { key: "unpriced", tone: "bad", count: totalUnpriced, note: "clients",
+      tile: "Unpriced clients", title: "Categories with no rate",
+      sub: "These clients are calculated but not priced. Map each one to a tier and they flow straight through.",
+      body: () => totalUnpriced
+        ? '<table><thead><tr><th>Master category</th><th class="num">Master clients</th><th class="num">Old table</th>' +
+          '<th class="num">Current fees</th><th></th></tr></thead><tbody>' +
+          c.unpricedCats.map(([cat, n]) => {
+            const cur = c.masters.filter(m => (m.category || "(blank)") === cat).reduce((a, m) => a + (m.currentFee || 0), 0);
+            const legacy = rc.legacyRates[cat];
+            return "<tr><td><strong>" + esc(cat) + '</strong></td><td class="num">' + n + '</td><td class="num">' +
+              (legacy == null ? '<span class="muted">&mdash;</span>' : money(legacy)) + '</td><td class="num">' + money(cur) +
+              "</td><td>" + (can("rateCardEdit") ? '<button class="btn ghost btn-sm" data-addcat="' + esc(cat) + '">Map to a tier</button>' : "") +
+              "</td></tr>";
+          }).join("") + "</tbody></table>"
+        : none("Every category in this run has a rate. Nothing to do.") },
+
+    { key: "ambiguous", tone: "warn", count: c.ambiguous.length, note: "codes",
+      tile: "Codes to confirm", title: "Category codes worth confirming",
+      sub: "Priced by name match, but the same code meant a different tier on the old table",
+      body: () => c.ambiguous.length
+        ? '<table><thead><tr><th>Xplan category</th><th class="num">Clients</th><th class="num">Old table</th>' +
+          '<th class="num">Pricing at</th><th></th></tr></thead><tbody>' +
+          c.ambiguous.map(e => "<tr><td><strong>" + esc(e.category) + '</strong></td><td class="num">' + e.clients +
+            '</td><td class="num">' + money(rc.legacyRates[e.category]) + '</td><td class="num">' + money(e.rate) +
+            "</td><td>" + (can("rateCardEdit") ? '<button class="btn ghost btn-sm" data-addcat="' + esc(e.category) + '">Review mapping</button>' : "") +
+            "</td></tr>").join("") + "</tbody></table>"
+        : none("No code is priced by a name match that the old table disagrees with.") },
+
+    { key: "advisers", tone: "warn", count: c.unknownAdvisers.length, note: "advisers",
+      tile: "Unknown advisers", title: "Advisers not in the directory",
+      sub: "No region, and no one to send a report to.",
+      body: () => c.unknownAdvisers.length
+        ? '<table><thead><tr><th>Adviser</th><th class="num">Master clients</th><th></th></tr></thead><tbody>' +
+          c.unknownAdvisers.map(a => "<tr><td>" + esc(a) + '</td><td class="num">' +
+            c.masters.filter(m => m.adviser === a).length + "</td><td>" +
+            (can("people") ? '<button class="btn ghost btn-sm" data-addadv="' + esc(a) + '">Add adviser</button>' : "") +
+            "</td></tr>").join("") + "</tbody></table>"
+        : none("Every adviser in this run is in the directory.") },
+
+    { key: "below", tone: "bad", count: below.length, note: "clients",
+      tile: "Below current fee", title: "Fees below the current fee",
+      sub: "A percentage can multiply out under what the client pays today. The rate card fee cannot, so these are always adviser-set.",
+      body: () => below.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Fee type</th><th class="num">Current fee</th>' +
+          '<th class="num">Adviser fee</th><th class="num">Shortfall</th></tr></thead><tbody>' +
+          below.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) + "</td><td>" + esc(feeTypeLabel(m)) +
+            '</td><td class="num">' + money(m.currentFee) + '</td><td class="num">' + money(m.fee) +
+            '</td><td class="num">' + money(m.fee - m.currentFee) + "</td></tr>").join("") + "</tbody></table>"
+        : none("No fee falls below the current fee.") },
+
+    { key: "offband", tone: "warn", count: off.length, note: "clients",
+      tile: "Off band", title: "Fees outside the " + (rc.variancePct * 100) + "% band",
+      sub: "A warning only — advisers are not blocked from setting these.",
+      body: () => off.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Rate card</th>' +
+          '<th class="num">Adviser fee</th><th class="num">Difference</th></tr></thead><tbody>' +
+          off.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) + '</td><td class="num">' + money(m.rateCardFee) +
+            '</td><td class="num">' + money(m.fee) + '</td><td class="num">' + money(m.diffToCard) + "</td></tr>").join("") +
+          "</tbody></table>"
+        : none("No fee sits outside the band.") },
+
+    /* Cap breaches are per account, so this lists accounts rather than clients —
+       the fund is where the number has to change. */
+    { key: "overcap", tone: "bad", count: c.overCap.length, note: "clients",
+      tile: "Over a platform cap", title: "Over a platform fee cap",
+      sub: "More than the platform will let us draw from the account. Not a Coastal rule — the fee will be rejected or trimmed at their end.",
+      body: () => capRows.length
+        ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Platform</th><th>Adviser</th>' +
+          '<th class="num">Balance</th><th class="num">Drawing</th><th class="num">Maximum</th>' +
+          '<th class="num">Over by</th></tr></thead><tbody>' +
+          capRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+            "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) + "</td>" +
+            "<td>" + esc(r.fund ? r.fund.name : "—") +
+              '<div class="small muted">' + (r.capBinding === "percentage" ? r.fund.capPct.toFixed(2) + "% of balance" : "flat cap") + "</div></td>" +
+            "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
+            '</td><td class="num">' + money(r.feeShare) + '</td><td class="num">' + money(r.capValue) +
+            '</td><td class="num">' + money(r.overCapBy) + "</td></tr>").join("") + "</tbody></table>"
+        : none("Every account is inside its platform's cap.") },
+
+    { key: "undermin", tone: "bad", count: c.underMinBalance.length, note: "clients",
+      tile: "Under a platform minimum", title: "Under a platform minimum balance",
+      sub: "The platform will not process an advice fee at all on a balance this small, so the fee simply would not arrive.",
+      body: () => minRows.length
+        ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Platform</th><th>Adviser</th>' +
+          '<th class="num">Balance</th><th class="num">Minimum</th><th class="num">Fee at risk</th></tr></thead><tbody>' +
+          minRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+            "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) + "</td><td>" + esc(r.fund.name) + "</td>" +
+            "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
+            '</td><td class="num">' + money(r.fund.minBalance) + '</td><td class="num">' + money(r.feeShare) +
+            "</td></tr>").join("") + "</tbody></table>"
+        : none("No account is under its platform's minimum.") },
+
+    /* The one on this screen that is a conversation rather than a correction. */
+    { key: "split", tone: "warn", count: c.needSplit.length, note: "clients",
+      tile: "Needing a direct debit", title: "Fees needing a direct debit",
+      sub: "Part of the fee cannot come off the platform, either because the platform will not allow it or because our own draw limit will not. The adviser needs to raise it with the client.",
+      body: () => (rc.maxDrawPct > 0 && rc.absoluteMinimum > 0
+          ? '<div class="banner info" style="margin-bottom:14px">Our rule bites below <strong>' +
+            money(rc.absoluteMinimum / (rc.maxDrawPct / 100)) + "</strong> of FUM &mdash; the point where " +
+            rc.maxDrawPct + "% stops reaching the " + money(rc.absoluteMinimum) +
+            " minimum fee. Above that line only a platform's own cap or minimum can force a split.</div>"
+          : "") +
+        (splitRows.length
+          ? '<table><thead><tr><th>Master client</th><th>Account</th><th>Adviser</th><th class="num">Balance</th>' +
+            '<th class="num">Fee</th><th class="num">Platform can take</th><th class="num">By direct debit</th><th>Why</th>' +
+            '<th class="num">FUM needed</th></tr></thead><tbody>' +
+            splitRows.map(({ m, r }) => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+              "<td>" + esc(r.manual ? r.subfundName : fundLabel(r)) +
+                '<div class="small muted">' + esc(r.fund ? r.fund.name : "—") + "</div></td>" +
+              "<td>" + esc(m.adviser) + '</td><td class="num">' + money(r.valueUsed) +
+              '</td><td class="num">' + money(r.feeShare) +
+              '</td><td class="num">' + money(r.platformMax) +
+              '</td><td class="num"><strong>' + money(r.shortfall) + "</strong></td>" +
+              "<td>" + (r.limitedBy === "minimum balance"
+                  ? "under the " + money(r.fund.minBalance) + " platform minimum"
+                : r.limitedBy === "house rule"
+                  ? "our " + rc.maxDrawPct + "% draw limit"
+                  : "over the " + money(r.capValue) + " platform cap") +
+                (r.limitedBy === "house rule" ? "" : '<div class="small muted">the platform\'s rule</div>') + "</td>" +
+              '<td class="num">' + (r.fumForFullFee == null ? '<span class="muted">&mdash;</span>' : money(r.fumForFullFee)) +
+              "</td></tr>").join("") + "</tbody></table>" +
+            '<div class="spacer"></div><div class="small muted"><strong>FUM needed</strong> is the balance this account would ' +
+            "have to hold for the platform to carry the whole fee on its own &mdash; the figure to quote if the answer is " +
+            "consolidating rather than a direct debit. Blank where the platform has a flat cap or a minimum balance, because " +
+            "no amount of FUM changes those.</div>"
+          : none("Every fee can be drawn in full from its platform.")) },
+
+    { key: "nocap", tone: "warn", count: c.unknownFunds.length, note: "platforms",
+      tile: "Platforms with no cap", title: "Platforms with no cap recorded",
+      sub: "In this run, but not in the fund table — so nothing is checked against them.",
+      actions: can("rateCardEdit")
+        ? '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnGoFunds">Open Rate/Fee Settings</button></div>' : "",
+      body: () => c.unknownFunds.length
+        ? '<table><thead><tr><th>Platform</th><th class="num">Accounts</th><th class="num">Balance</th>' +
+          '<th class="num">Fees drawn</th></tr></thead><tbody>' +
+          c.unknownFunds.map(v => {
+            const rs = c.rows.filter(r => r.included && !r.fund && r.vendorUsed === v);
+            return "<tr><td><strong>" + esc(v) + '</strong></td><td class="num">' + rs.length +
+              '</td><td class="num">' + money(rs.reduce((a, r) => a + r.valueUsed, 0)) +
+              '</td><td class="num">' + money(rs.reduce((a, r) => a + (r.feeShare || 0), 0)) + "</td></tr>";
+          }).join("") + "</tbody></table>"
+        : none("Every platform in this run has an entry in the fund table.") },
+
+    { key: "unsetfunds", tone: "warn", count: unsetTotal, note: "funds",
+      tile: "Funds with no fee type", title: "Clients priced by fund with funds not set",
+      sub: "A fund with no fee type charges nothing, so the client total is understated.",
+      body: () => c.unsetFundClients.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Funds unset</th>' +
+          '<th class="num">Charging</th></tr></thead><tbody>' +
+          c.unsetFundClients.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) +
+            '</td><td class="num">' + m.unsetFunds + " of " + m.rows.filter(r => r.included).length +
+            '</td><td class="num">' + money(m.fee) + "</td></tr>").join("") + "</tbody></table>"
+        : none("Every fund on every client priced by fund has a fee type.") },
+
+    { key: "shortfall", tone: "bad", count: c.paymentShortfalls.length, note: "clients",
+      tile: "Payment shortfalls", title: "Payment shortfalls",
+      sub: "Fund amounts add up to less than the client's fee.",
+      body: () => c.paymentShortfalls.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Fee</th>' +
+          '<th class="num">Allocated</th><th class="num">Short</th></tr></thead><tbody>' +
+          c.paymentShortfalls.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) +
+            '</td><td class="num">' + money(m.fee) + '</td><td class="num">' + money(m.collected) +
+            '</td><td class="num">' + money(m.paymentGap) + "</td></tr>").join("") + "</tbody></table>"
+        : none("Every client with split payments reconciles to its fee.") }
+  ];
+
+  /* Neither of these is something to fix, so neither opens anything. */
+  const extras = [
+    { t: "Excluded rows", v: c.droppedRows.toLocaleString("en-AU"), n: "zero value or no platform" },
+    { t: "Hidden placeholders", v: c.hiddenDefaults.toLocaleString("en-AU"),
+      n: state.showEmptyDefaults ? "showing — see Settings" : "empty “Default” accounts" }
+  ];
+
+  const open = sections.filter(s => s.count).length;
+  let html = open
+    ? '<div class="banner ' + (sections.some(s => s.count && s.tone === "bad") ? "warn" : "info") +
+      ' no-print"><strong>' + open + " of " + sections.length + " checks have something in them.</strong> " +
+      "Anything in red is open below; the rest are folded with their count on the header. Click a tile to jump to one.</div>"
+    : '<div class="banner ok no-print"><strong>Nothing outstanding.</strong> Every check on this run is clear.</div>';
+
+  html += exceptionTiles(sections, extras);
+  html += sections.map(exceptionSection).join("");
   return html;
 }
 
@@ -4952,122 +5036,205 @@ function paintPricing() {
   }
 }
 
+/* =========================================================================
+   Rate/Fee Settings
+   Two tabs, because the screen holds two different price lists: what the
+   monthly review charges, and what the Pricing Calculator quotes. Every block
+   folds, and starts folded — this is a screen people arrive at to change one
+   thing, not to read. Anything wanting attention says so on its tile and opens
+   itself.
+   ========================================================================= */
+
+/* One folding block. `body` is a function so a closed section costs nothing to
+   build — several of these are long tables. */
+/* The shell both folding screens share. `body` is a function so a closed
+   section costs nothing to build — several of these are long tables. */
+function foldShell(o) {
+  return '<div class="card rcs" id="' + o.id + '">' +
+    '<div class="card-h fold" ' + o.attr + '="' + o.key + '" role="button" tabindex="0" ' +
+    'aria-expanded="' + o.open + '"><h2>' + esc(o.title) + "</h2>" +
+    (o.sub ? '<div class="sub">' + esc(o.sub) + "</div>" : "") +
+    '<div class="right">' + (o.badge || "") +
+    '<span class="fold-caret' + (o.open ? " open" : "") + '" aria-hidden="true"></span></div></div>' +
+    (o.open ? '<div class="card-b">' + (o.actions || "") + o.body() + "</div>" : "") + "</div>";
+}
+
+function settingsSection(s) {
+  /* Closed unless somebody has said otherwise — except a section carrying a
+     warning, which opens itself, because a folded warning is a warning nobody
+     reads. Once it is toggled by hand that choice sticks. */
+  return foldShell({
+    id: "rcs-" + s.key, attr: "data-rcfold", key: s.key, title: s.title, sub: s.sub,
+    open: state.rcOpen[s.key] === undefined ? !!s.warn : !!state.rcOpen[s.key],
+    badge: s.warn ? '<span class="pill warn">' + esc(s.warn) + "</span>"
+         : s.meta ? '<span class="small muted">' + esc(s.meta) + "</span>" : "",
+    actions: s.actions, body: s.body
+  });
+}
+
+/* The index across the top. A tile carries whatever the section's header would
+   have said, so the warnings are visible without opening anything. */
+function settingsTiles(sections) {
+  return '<div class="tiles no-print">' + sections.map(s =>
+    '<button class="tile' + (s.warn ? " warn" : "") + '" data-rcjump="' + s.key + '">' +
+    '<span class="t">' + esc(s.title) + "</span>" +
+    '<span class="n">' + esc(s.warn || s.meta || "") + "</span></button>").join("") + "</div>";
+}
+
+/* What the monthly review prices against. */
+function reviewSections(ro) {
+  const rc = state.rateCard, c = state.calc;
+  const unpriced = rc.categories.filter(x => !(num(x.annual) > 0)).length;
+  const capless = state.funds.filter(f => f.active !== false && !(f.capPct > 0) && !(f.capAmount > 0)).length;
+  const fundTrouble = c ? (c.unknownFunds.length + c.noPlatform.length + c.fundClashes.length) : 0;
+  const noRate = c ? c.categories.filter(e => e.rate == null).length : 0;
+
+  return [
+    { key: "cats", title: "Category rates",
+      meta: rc.categories.length + (rc.categories.length === 1 ? " tier" : " tiers"),
+      warn: !rc.categories.length ? "none set"
+          : unpriced ? unpriced + " with no fee" : "",
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddCat">Add category</button></div>',
+      body: () =>
+        '<table><thead><tr><th>Category</th><th class="num">Annual fee</th><th class="no-print"></th></tr></thead><tbody>' +
+        rc.categories.map((x, i) =>
+          '<tr><td><input type="text" class="grow-x" data-rc="cat" data-i="' + i + '" data-f="name" value="' + esc(x.name) + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-rc="cat" data-i="' + i + '" data-f="annual" value="' + x.annual + '"' + ro + "></td>" +
+          (ro ? "<td></td>" : '<td class="no-print"><button class="btn ghost icon-x" data-delcat="' + i +
+            '" title="Remove ' + esc(x.name) + '" aria-label="Remove ' + esc(x.name) + '">&times;</button></td>') + "</tr>").join("") +
+        "</tbody></table>" },
+
+    { key: "entities", title: "Additional entities",
+      sub: "What a client group costs beyond its master client",
+      meta: rc.entityWeights.length + " type" + (rc.entityWeights.length === 1 ? "" : "s"),
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddWt">Add entity type</button></div>',
+      body: () =>
+        '<div class="field"><label>Fee per weighted entity</label><input type="number" data-rc="scalar" data-f="additionalEntityFee" value="' + rc.additionalEntityFee + '"' + ro + "></div>" +
+        '<div class="spacer"></div>' +
+        (rc.entityWeights.length
+          ? '<div class="tbl-scroll"><table><thead><tr><th>Entity type</th><th class="num">Weight</th><th class="num">Adds</th>' +
+            (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+            rc.entityWeights.map((w, i) =>
+              '<tr><td><input type="text" class="grow-x" data-rc="wt" data-i="' + i + '" data-f="name" value="' + esc(w.name) + '"' + ro + "></td>" +
+              '<td class="num"><input type="number" step="0.5" class="w80 num" data-rc="wt" data-i="' + i + '" data-f="weight" value="' + w.weight + '"' + ro + "></td>" +
+              '<td class="num mono">' + money(num(w.weight) * num(rc.additionalEntityFee)) + "</td>" +
+              (ro ? "" : '<td class="no-print"><button class="btn ghost icon-x" data-delwt="' + i +
+                '" title="Remove ' + esc(w.name) + '" aria-label="Remove ' + esc(w.name) + '">&times;</button></td>') +
+              "</tr>").join("") + "</tbody></table></div>"
+          : '<div class="muted">No entity types yet, so no client picks up an additional entity fee.</div>') +
+        '<div class="spacer"></div><div class="small muted">A client group is often more than one entity &mdash; a family trust, ' +
+        "an SMSF, a company &mdash; and each one is more work than the master client alone. Every entity type above carries a " +
+        "<strong>weight</strong>; the weights on a client are added up and multiplied by the <strong>fee per weighted entity</strong>, " +
+        "and that amount is added to their rate card fee." +
+        "<br><br>An entity is only counted when its category differs from the master client's, it is not the master record itself, " +
+        "and its type is listed above. It is counted <strong>once per entity</strong>, however many accounts it holds. Anything " +
+        "not listed has a weight of nothing and adds no fee.</div>" },
+
+    { key: "surcharge", title: "FUM surcharge",
+      sub: "An amount on top of the category rate, scaled to how much the client holds",
+      meta: rc.surchargeBands.length + " band" + (rc.surchargeBands.length === 1 ? "" : "s"),
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddBand">Add band</button></div>',
+      body: () =>
+        (rc.surchargeBands.length
+          ? '<div class="tbl-scroll"><table><thead><tr><th class="num">FUM above</th><th class="num">Rate</th>' +
+            (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+            rc.surchargeBands.map((b, i) =>
+              '<tr><td class="num"><input type="number" class="w110 num" data-rc="band" data-i="' + i + '" data-f="from" value="' + b.from + '"' + ro + "></td>" +
+              '<td class="num"><input type="number" step="0.0001" class="w80 num" data-rc="band" data-i="' + i + '" data-f="rate" value="' + b.rate + '"' + ro + ">" +
+                '<div class="small muted">' + (num(b.rate) * 100).toFixed(2) + "%</div></td>" +
+              (ro ? "" : '<td class="no-print"><button class="btn ghost icon-x" data-delband="' + i +
+                '" title="Remove this band" aria-label="Remove this band">&times;</button></td>') +
+              "</tr>").join("") + "</tbody></table></div>"
+          : '<div class="muted">No bands, so no client pays a surcharge.</div>') +
+        '<div class="spacer"></div><div class="small muted"><strong>Marginal, like tax brackets.</strong> Each band charges its ' +
+        "rate only on the part of a client's FUM above that band's threshold, not on the whole balance &mdash; so moving up a " +
+        "band never causes a jump in the fee. The total is added to the category rate and the entity fee to make the rate card fee." +
+        "<br><br>Rates are decimals: <code>0.008</code> is 0.80%. Order does not matter, the bands are sorted by threshold when " +
+        "they are applied. Delete every band and the surcharge is simply zero.</div>" +
+        surchargeWorkedExample(rc) },
+
+    { key: "rules", title: "Rules",
+      sub: "The minimum fee, the direct debit split, and the warning band",
+      meta: rc.absoluteMinimum > 0 ? "minimum " + money(rc.absoluteMinimum) : "",
+      warn: rc.absoluteMinimum > 0 ? "" : "no minimum fee set",
+      body: () =>
+        '<div class="field"><label>Minimum fee</label><input type="number" data-rc="scalar" data-f="absoluteMinimum" value="' + rc.absoluteMinimum + '"' + ro + "></div>" +
+        '<div class="spacer"></div><div class="field"><label>FUM % minimum (% of FUM, 0 to turn off)</label>' +
+        '<input type="number" step="0.01" data-rc="scalar" data-f="maxDrawPct" value="' + rc.maxDrawPct + '"' + ro + "></div>" +
+        '<div class="spacer"></div><div class="small muted">A client\'s fee never falls below what they pay today &mdash; the rate card ' +
+        "fee is the higher of (category + entities + surcharge), the current fee, and the <strong>minimum fee</strong>." +
+        (rc.maxDrawPct > 0 && rc.absoluteMinimum > 0
+          ? "<br><br>Where <strong>" + rc.maxDrawPct + "%</strong> of a client's FUM comes to less than that " +
+            money(rc.absoluteMinimum) + ", only the " + rc.maxDrawPct + "% is drawn from the platform and the rest is direct " +
+            "debited. That line sits at <strong>" + money(rc.absoluteMinimum / (rc.maxDrawPct / 100)) + "</strong> of FUM: below " +
+            "it the payment is set to a split automatically and both amounts are filled in; above it the fee is collectable as a " +
+            "percentage and nothing changes. It sets no fee &mdash; pricing is untouched, only how the fee arrives." +
+            "<br><br>Ceilings imposed by the platforms are a separate matter, and are left to the adviser rather than applied " +
+            "automatically &mdash; see <strong>Fund fee caps</strong>. Where both bite, the lower wins."
+          : "<br><br>Set a <strong>FUM % minimum</strong> to turn on the direct debit split for clients too small to carry the " +
+            "minimum fee as a percentage.") +
+        "</div>" +
+        '<div class="spacer"></div><div class="field"><label>Soft warning band (fraction, e.g. 0.10)</label>' +
+        '<input type="number" step="0.01" data-rc="scalar" data-f="variancePct" value="' + rc.variancePct + '"' + ro + "></div>" +
+        '<div class="spacer"></div><div class="small muted">How far an adviser\'s fee may sit from the rate card fee before it is ' +
+        "flagged <strong>off band</strong>, in either direction. " + (rc.variancePct * 100) + "% at this setting. A warning only " +
+        "&mdash; nobody is blocked from setting a fee outside it, and it changes no number.</div>" },
+
+    { key: "gst", title: "GST",
+      sub: "Only used to line our fees up against a platform's cap",
+      meta: rc.feesInclGst ? "ours include GST" : "ours exclude GST",
+      body: () =>
+        '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" data-rc="bool" data-f="feesInclGst"' +
+          (rc.feesInclGst ? " checked" : "") + (ro ? " disabled" : "") + "> Our fees include GST</label>" +
+        '<div class="spacer"></div><div class="field"><label>GST rate</label>' +
+        '<input type="number" step="0.01" data-rc="scalar" data-f="gstRate" value="' + rc.gstRate + '"' + ro + "></div>" +
+        '<div class="spacer"></div><div class="small muted">Only used to line our fees up against a platform\'s fee cap. ' +
+        "Most platforms state their cap inclusive of GST and a few state it exclusive, so each fund records which &mdash; " +
+        "without this the comparison is wrong by " + Math.round(num(rc.gstRate) * 100) + "% in one direction or the other.</div>" },
+
+    { key: "funds", title: "Fund fee caps",
+      sub: "The most each platform will let us draw from an account",
+      meta: state.funds.length + " platform" + (state.funds.length === 1 ? "" : "s"),
+      warn: !state.funds.length ? "none set"
+          : fundTrouble ? "needs a look"
+          : capless ? capless + " with no cap" : "",
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddFund">Add fund</button></div>',
+      body: fundCapBody },
+
+    { key: "mapping", title: "Category mapping",
+      sub: "What each Xplan Master Category means on the current rate card",
+      meta: c ? c.categories.length + " in this run" : "no run loaded",
+      warn: noRate ? noRate + " with no rate" : "",
+      actions: (ro || !c) ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnClearMap">Clear all mappings</button></div>',
+      body: categoryMappingBody }
+  ];
+}
+
 function viewRateCard() {
-  const rc = state.rateCard;
   const ro = !can("rateCardEdit") ? " disabled" : "";
-  let html = '<div class="banner info no-print">This is the single source of truth for pricing. Runs keep a snapshot of the card ' +
-    'they were calculated against, so changing it here never rewrites a locked month.</div>';
+  const tab = state.rcTab === "pricing" ? "pricing" : "review";
+  const tabBtn = (id, label) =>
+    '<button class="' + (tab === id ? "on" : "") + '" data-rctab="' + id + '" aria-pressed="' + (tab === id) + '">' +
+    esc(label) + "</button>";
+
+  let html = '<div class="toggle-row no-print" style="margin-bottom:16px"><span class="seg">' +
+    tabBtn("review", "Fee review pricing") + tabBtn("pricing", "Pricing calculator") + "</span>" +
+    '<span class="small muted" style="max-width:52ch">' +
+    (tab === "pricing"
+      ? "What the Pricing Calculator quotes &mdash; Coastal's own price list for new and existing clients."
+      : "What the monthly review prices clients against.") +
+    "</span></div>";
+
+  html += '<div class="banner info no-print">This is the single source of truth for pricing. Runs keep a snapshot of the card ' +
+    "they were calculated against, so changing anything here never rewrites a locked month.</div>";
   if (ro) {
     html += '<div class="banner warn no-print"><strong>Read only.</strong> Pricing is set by Managers and Admins. ' +
-      'You can see what is here and how each Xplan category resolves, but not change it.</div>';
+      "You can see what is here and how each Xplan category resolves, but not change it.</div>";
   }
 
-  /* Wider columns than the default grid: a category row carries a name that
-     grows, a five-digit fee and a delete, and none of that fits in 280px. */
-  html += '<div class="grid2 wide">';
-
-  html += '<div class="card"><div class="card-h"><h2>Category rates</h2>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnAddCat">Add category</button></div>') + '</div><div class="card-b">' +
-    '<table><thead><tr><th>Category</th><th class="num">Annual fee</th><th class="no-print"></th></tr></thead><tbody>' +
-    rc.categories.map((c, i) =>
-      '<tr><td><input type="text" class="grow-x" data-rc="cat" data-i="' + i + '" data-f="name" value="' + esc(c.name) + '"' + ro + '></td>' +
-      '<td class="num"><input type="number" class="w110 num" data-rc="cat" data-i="' + i + '" data-f="annual" value="' + c.annual + '"' + ro + '></td>' +
-      (ro ? "<td></td>" : '<td class="no-print"><button class="btn ghost icon-x" data-delcat="' + i +
-        '" title="Remove ' + esc(c.name) + '" aria-label="Remove ' + esc(c.name) + '">&times;</button></td>') + "</tr>").join("") +
-    "</tbody></table></div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>Additional entities</h2>' +
-    '<div class="sub">What a client group costs beyond its master client</div>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnAddWt">Add entity type</button></div>') +
-    '</div><div class="card-b">' +
-    '<div class="field"><label>Fee per weighted entity</label><input type="number" data-rc="scalar" data-f="additionalEntityFee" value="' + rc.additionalEntityFee + '"' + ro + '></div>' +
-    '<div class="spacer"></div>' +
-    (rc.entityWeights.length
-      ? '<div class="tbl-scroll"><table><thead><tr><th>Entity type</th><th class="num">Weight</th><th class="num">Adds</th>' +
-        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-        rc.entityWeights.map((w, i) =>
-          '<tr><td><input type="text" class="grow-x" data-rc="wt" data-i="' + i + '" data-f="name" value="' + esc(w.name) + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" step="0.5" class="w80 num" data-rc="wt" data-i="' + i + '" data-f="weight" value="' + w.weight + '"' + ro + "></td>" +
-          '<td class="num mono">' + money(num(w.weight) * num(rc.additionalEntityFee)) + "</td>" +
-          (ro ? "" : '<td class="no-print"><button class="btn ghost icon-x" data-delwt="' + i +
-            '" title="Remove ' + esc(w.name) + '" aria-label="Remove ' + esc(w.name) + '">&times;</button></td>') +
-          "</tr>").join("") + "</tbody></table></div>"
-      : '<div class="muted">No entity types yet, so no client picks up an additional entity fee.</div>') +
-    '<div class="spacer"></div><div class="small muted">A client group is often more than one entity &mdash; a family trust, ' +
-    'an SMSF, a company &mdash; and each one is more work than the master client alone. Every entity type above carries a ' +
-    '<strong>weight</strong>; the weights on a client are added up and multiplied by the <strong>fee per weighted entity</strong>, ' +
-    'and that amount is added to their rate card fee.' +
-    '<br><br>An entity is only counted when its category differs from the master client\'s, it is not the master record itself, ' +
-    'and its type is listed above. It is counted <strong>once per entity</strong>, however many accounts it holds. Anything ' +
-    'not listed has a weight of nothing and adds no fee.</div>' +
-    "</div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>FUM surcharge</h2>' +
-    '<div class="sub">An amount on top of the category rate, scaled to how much the client holds</div>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnAddBand">Add band</button></div>') +
-    '</div><div class="card-b">' +
-    (rc.surchargeBands.length
-      /* Three columns, not four: the percentage sits under the rate it restates
-         rather than taking a column of its own. This card lives in half the
-         page width and a fourth column pushed it over the edge. */
-      ? '<div class="tbl-scroll"><table><thead><tr><th class="num">FUM above</th><th class="num">Rate</th>' +
-        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-        rc.surchargeBands.map((b, i) =>
-          '<tr><td class="num"><input type="number" class="w110 num" data-rc="band" data-i="' + i + '" data-f="from" value="' + b.from + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" step="0.0001" class="w80 num" data-rc="band" data-i="' + i + '" data-f="rate" value="' + b.rate + '"' + ro + ">" +
-            '<div class="small muted">' + (num(b.rate) * 100).toFixed(2) + "%</div></td>" +
-          (ro ? "" : '<td class="no-print"><button class="btn ghost icon-x" data-delband="' + i +
-            '" title="Remove this band" aria-label="Remove this band">&times;</button></td>') +
-          "</tr>").join("") + "</tbody></table></div>"
-      : '<div class="muted">No bands, so no client pays a surcharge.</div>') +
-    '<div class="spacer"></div><div class="small muted"><strong>Marginal, like tax brackets.</strong> Each band charges its ' +
-    'rate only on the part of a client\'s FUM above that band\'s threshold, not on the whole balance &mdash; so moving up a ' +
-    'band never causes a jump in the fee. The total is added to the category rate and the entity fee to make the rate card fee.' +
-    '<br><br>Rates are decimals: <code>0.008</code> is 0.80%. Order does not matter, the bands are sorted by threshold when ' +
-    'they are applied. Delete every band and the surcharge is simply zero.</div>' +
-    surchargeWorkedExample(rc) +
-    "</div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>Rules</h2></div><div class="card-b">' +
-    '<div class="field"><label>Minimum fee</label><input type="number" data-rc="scalar" data-f="absoluteMinimum" value="' + rc.absoluteMinimum + '"' + ro + '></div>' +
-    '<div class="spacer"></div><div class="field"><label>FUM % minimum (% of FUM, 0 to turn off)</label>' +
-    '<input type="number" step="0.01" data-rc="scalar" data-f="maxDrawPct" value="' + rc.maxDrawPct + '"' + ro + '></div>' +
-
-    '<div class="spacer"></div><div class="small muted">A client\'s fee never falls below what they pay today &mdash; the rate card ' +
-    'fee is the higher of (category + entities + surcharge), the current fee, and the <strong>minimum fee</strong>.' +
-    (rc.maxDrawPct > 0 && rc.absoluteMinimum > 0
-      ? "<br><br>Where <strong>" + rc.maxDrawPct + "%</strong> of a client's FUM comes to less than that " +
-        money(rc.absoluteMinimum) + ", only the " + rc.maxDrawPct + "% is drawn from the platform and the rest is direct " +
-        "debited. That line sits at <strong>" + money(rc.absoluteMinimum / (rc.maxDrawPct / 100)) + "</strong> of FUM: below " +
-        "it the payment is set to a split automatically and both amounts are filled in; above it the fee is collectable as a " +
-        "percentage and nothing changes. It sets no fee &mdash; pricing is untouched, only how the fee arrives." +
-        "<br><br>Ceilings imposed by the platforms are a separate matter, and are left to the adviser rather than applied " +
-        "automatically &mdash; see <strong>Fund fee caps</strong> below. Where both bite, the lower wins."
-      : "<br><br>Set a <strong>FUM % minimum</strong> to turn on the direct debit split for clients too small to carry the " +
-        "minimum fee as a percentage.") +
-    "</div>" +
-
-    '<div class="spacer"></div><div class="field"><label>Soft warning band (fraction, e.g. 0.10)</label>' +
-    '<input type="number" step="0.01" data-rc="scalar" data-f="variancePct" value="' + rc.variancePct + '"' + ro + '></div>' +
-    '<div class="spacer"></div><div class="small muted">How far an adviser\'s fee may sit from the rate card fee before it is ' +
-    "flagged <strong>off band</strong>, in either direction. " + (rc.variancePct * 100) + "% at this setting. A warning only " +
-    "&mdash; nobody is blocked from setting a fee outside it, and it changes no number.</div>" +
-    "</div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>GST</h2></div><div class="card-b">' +
-    '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" data-rc="bool" data-f="feesInclGst"' +
-      (rc.feesInclGst ? " checked" : "") + (ro ? " disabled" : "") + "> Our fees include GST</label>" +
-    '<div class="spacer"></div><div class="field"><label>GST rate</label>' +
-    '<input type="number" step="0.01" data-rc="scalar" data-f="gstRate" value="' + rc.gstRate + '"' + ro + "></div>" +
-    '<div class="spacer"></div><div class="small muted">Only used to line our fees up against a platform\'s fee cap. ' +
-    'Most platforms state their cap inclusive of GST and a few state it exclusive, so each fund records which &mdash; ' +
-    'without this the comparison is wrong by ' + Math.round(num(rc.gstRate) * 100) + '% in one direction or the other.</div>' +
-    "</div></div>";
-
-  html += "</div>";
-  html += fundCapCard();
-  html += categoryMappingCard();
-  html += pricingSettingsCard();
+  const sections = tab === "pricing" ? pricingSections(ro) : reviewSections(ro);
+  html += settingsTiles(sections);
+  html += sections.map(settingsSection).join("");
   return html;
 }
 
@@ -5083,168 +5250,188 @@ function newItemId(items) {
   return "i" + n;
 }
 
-/* Editing for everything the Pricing Calculator reads. It lives here rather
-   than on the calculator itself so advisers get a calculator, not a price list
-   they can retype. */
-function pricingSettingsCard() {
+/* Editing for everything the Pricing Calculator reads. It lives on its own tab
+   here rather than on the calculator itself, so advisers get a calculator and
+   not a price list they can retype. */
+function pricingSections(ro) {
   const p = pricing();
-  const ro = !can("rateCardEdit") ? " disabled" : "";
   const del = (what, i, extra) => ro ? "" :
     '<td class="no-print"><button class="btn ghost icon-x" data-pedel="' + what + '" data-i="' + i + '"' +
     (extra || "") + ' title="Remove" aria-label="Remove">&times;</button></td>';
+  const addBtn = (attrs, label) => ro ? "" :
+    '<div class="no-print" style="margin:0 0 10px"><button class="btn ghost btn-sm" ' + attrs + ">" + label + "</button></div>";
 
-  let html = '<div class="card" style="margin-top:16px"><div class="card-h"><h2>Pricing calculator</h2>' +
-    '<div class="sub">What the Pricing Calculator screen quotes from</div>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnPriceLoad">Load pricing</button>' +
-      '<button class="btn ghost btn-sm" id="btnPriceCopy">Copy pricing</button></div>') +
-    '</div><div class="card-b">';
-
-  html += '<div class="banner info no-print">These are Coastal\'s own prices, not a platform\'s. They travel with the ' +
-    'rate card, so there is one place pricing lives and one thing to keep current. Advisers see the calculator, ' +
-    'never this screen.</div>';
-
-  html += '<div class="field"><label>Pricing last reviewed</label>' +
-    '<input type="text" data-pe="scalar" data-f="reviewed" value="' + esc(p.reviewed || "") +
-    '" placeholder="30 June 2026"' + ro + "></div>";
-
-  /* ---- line items, grouped by what they are ---- */
-  for (const sec of PRICE_SECTIONS) {
-    const rows = (p.items || []).map((it, i) => ({ it, i })).filter(x => x.it.section === sec.id);
-    html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">' +
-      esc(sec.group) + " &mdash; " + esc(sec.label) + "</h2>" +
-      (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="item" data-sec="' +
-        sec.id + '">Add line</button></div>') + "</div>";
-    html += rows.length
-      ? '<div class="tbl-scroll"><table><thead><tr><th>Line</th><th>Applies</th>' +
-        '<th class="num">NEW</th><th class="num">EXISTING</th><th>Cancels minimum</th>' +
-        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-        rows.map(({ it, i }) =>
-          '<tr><td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="label" value="' +
-            esc(it.label || "") + '"' + ro + "></td>" +
-          '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
-            PRICE_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
-              { min: "once", each: "per item", hour: "per hour" }[k] + "</option>").join("") + "</select></td>" +
-          '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
-            '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
-          '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
-            '" data-f="existingPrice" value="' + priceBox(it.existingPrice) + '" placeholder="n/a"' + ro + "></td>" +
-          '<td><input type="checkbox" data-pe="itemBool" data-i="' + i + '" data-f="suppressesMin"' +
-            (it.suppressesMin ? " checked" : "") + ro + "></td>" +
-          del("item", i) + "</tr>").join("") + "</tbody></table></div>"
-      : '<div class="muted">No lines in this section.</div>';
-  }
-
-  html += '<div class="spacer"></div><div class="small muted">An empty price box means the line <strong>does not exist</strong> ' +
-    'for that client type &mdash; different from a price of zero, which is a real price of nothing. ' +
-    '<strong>Once</strong> lines apply on their own with no quantity; <strong>cancels minimum</strong> marks a line that waives ' +
-    "its section's once-line when it is used, which is how an insurance-only engagement escapes the base SOA fee.</div>";
-
-  /* ---- FUM ladders ---- */
-  html += '<div class="spacer"></div><div class="grid2 wide">';
-  for (const ct of ["NEW", "EXISTING"]) {
-    const bands = ((p.ladders || {})[ct] || []);
-    html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">FUM ladder &mdash; ' +
-      ct + "</h2>" + (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="ladder" data-ct="' +
-        ct + '">Add band</button></div>') + "</div>" +
-      (bands.length
-        ? '<div class="tbl-scroll"><table><thead><tr><th class="num">FUM above</th><th class="num">Rate</th>' +
-          (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-          bands.map((b, i) =>
-            '<tr><td class="num"><input type="number" class="w110 num" data-pe="ladder" data-ct="' + ct +
-              '" data-i="' + i + '" data-f="from" value="' + num(b.from) + '"' + ro + "></td>" +
-            '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="ladder" data-ct="' + ct +
-              '" data-i="' + i + '" data-f="rate" value="' + num(b.rate) + '"' + ro + ">" +
-              '<div class="small muted">' + (num(b.rate) * 100).toFixed(2) + "%</div></td>" +
-            del("ladder", i, ' data-ct="' + ct + '"') + "</tr>").join("") + "</tbody></table></div>"
-        : '<div class="muted">No bands, so FUM adds nothing for ' + ct + " clients.</div>") + "</div>";
-  }
-  html += "</div>";
-  html += '<div class="spacer"></div><div class="small muted">Marginal bands, the same shape as the FUM surcharge above. ' +
-    "The first band is normally a rate of zero: it is the stretch of FUM the minimum fee already covers. " +
-    "Rates are decimals &mdash; <code>0.0088</code> is 0.88%.</div>";
-
-  /* ---- packages and Centrelink ---- */
-  const packs = p.packages || [];
-  html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0">' +
-    '<h2 style="font-size:.9rem">Service packages and Centrelink administration</h2>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="pack">Add package</button></div>') + "</div>" +
-    '<div class="tbl-scroll"><table><thead><tr><th>Package</th><th class="num">Ongoing fee from</th>' +
-    '<th class="num">Centrelink admin</th><th class="num">Means tested</th>' + (ro ? "" : '<th class="no-print"></th>') +
-    "</tr></thead><tbody>" +
-    packs.map((k, i) =>
-      '<tr><td><input type="text" class="grow-x" data-pe="pack" data-i="' + i + '" data-f="name" value="' +
-        esc(k.name || "") + '"' + ro + "></td>" +
-      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="from" value="' +
-        num(k.from) + '"' + ro + "></td>" +
-      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="cas" value="' +
-        num(k.cas) + '"' + ro + "></td>" +
-      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="mtf" value="' +
-        num(k.mtf) + '"' + ro + "></td>" + del("pack", i) + "</tr>").join("") +
-    '<tr><td class="muted">No agreement</td><td class="num muted">&mdash;</td>' +
-    '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="cas" value="' +
-      num((p.noCsa || {}).cas) + '"' + ro + "></td>" +
-    '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="mtf" value="' +
-      num((p.noCsa || {}).mtf) + '"' + ro + "></td>" + (ro ? "" : "<td></td>") + "</tr>" +
-    "</tbody></table></div>" +
-    '<div class="spacer"></div><div class="small muted">A client falls into the highest package their <strong>total ongoing ' +
-    "fee</strong> reaches. The two Centrelink columns are that package's administration fee &mdash; the second applies when " +
-    "the client needs quarterly means-tested updates. Neither is part of the Client Service Agreement.</div>";
-
-  /* ---- insurance claims ---- */
+  const items = p.items || [];
+  const ladders = p.ladders || {};
   const cl = p.claims || {};
-  html += '<div class="spacer"></div><div class="grid2 wide">';
-  html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">Claim fee tiers (TPD)</h2>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="tier">Add tier</button></div>') + "</div>" +
-    ((cl.tiers || []).length
-      ? '<div class="tbl-scroll"><table><thead><tr><th class="num">Benefit above</th><th class="num">Rate</th>' +
-        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-        cl.tiers.map((t, i) =>
-          '<tr><td class="num"><input type="number" class="w110 num" data-pe="tier" data-i="' + i +
-            '" data-f="from" value="' + num(t.from) + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="tier" data-i="' + i +
-            '" data-f="rate" value="' + num(t.rate) + '"' + ro + ">" +
-            '<div class="small muted">' + (num(t.rate) * 100).toFixed(2) + "%</div></td>" +
-          del("tier", i) + "</tr>").join("") + "</tbody></table></div>"
-      : '<div class="muted">No claim tiers set.</div>') + "</div>";
-
-  html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">Claim hourly rates</h2>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="crate">Add rate</button></div>') + "</div>" +
-    ((cl.rates || []).length
-      ? '<div class="tbl-scroll"><table><thead><tr><th>Policy type</th><th class="num">Per hour</th>' +
-        '<th class="num">IP per month</th>' + (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-        cl.rates.map((r, i) =>
-          '<tr><td><input type="text" class="grow-x" data-pe="crate" data-i="' + i + '" data-f="label" value="' +
-            esc(r.label || "") + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="hourly" value="' +
-            num(r.hourly) + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="ipMonthly" value="' +
-            num(r.ipMonthly) + '"' + ro + "></td>" + del("crate", i) + "</tr>").join("") + "</tbody></table></div>"
-      : '<div class="muted">No hourly rates set.</div>') +
-    '<div class="spacer"></div><div class="field"><label>Multi-claim discount (fraction, e.g. 0.15)</label>' +
-    '<input type="number" step="0.01" data-pe="claimScalar" data-f="multiDiscount" value="' +
-      num(cl.multiDiscount) + '"' + ro + "></div></div>";
-  html += "</div>";
-
-  /* ---- reference text ---- */
   const refs = p.reference || [];
-  html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0">' +
-    '<h2 style="font-size:.9rem">Reference panels</h2>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="ref">Add panel</button></div>') + "</div>" +
-    (refs.length
-      ? '<div class="grid2 wide">' + refs.map((r, i) =>
-          '<div><input type="text" class="grow-x" data-pe="ref" data-i="' + i + '" data-f="title" value="' +
-            esc(r.title || "") + '" placeholder="Preferred platforms"' + ro + ">" +
-          '<div class="spacer" style="height:6px"></div>' +
-          '<textarea rows="6" style="width:100%" data-pe="ref" data-i="' + i + '" data-f="body"' + ro + ">" +
-            esc(r.body || "") + "</textarea>" +
-          (ro ? "" : '<button class="btn ghost btn-sm" data-pedel="ref" data-i="' + i + '">Remove panel</button>') +
-          "</div>").join("") + "</div>"
-      : '<div class="muted">No reference panels.</div>') +
-    '<div class="spacer"></div><div class="small muted">Shown at the bottom of the Pricing Calculator. This is where the ' +
-    "preferred insurer and platform lists live, and the Centrelink simple/complex criteria &mdash; which list something " +
-    "falls on is what decides which price applies.</div>";
 
-  return html + "</div></div>";
+  return [
+    { key: "p-meta", title: "Pricing sheet",
+      sub: "Where this price list came from, and how to replace it wholesale",
+      meta: p.reviewed ? "reviewed " + p.reviewed : "",
+      warn: items.length ? "" : "no pricing loaded",
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px">' +
+        '<button class="btn ghost btn-sm" id="btnPriceLoad">Load pricing</button> ' +
+        '<button class="btn ghost btn-sm" id="btnPriceCopy">Copy pricing</button></div>',
+      body: () =>
+        '<div class="field"><label>Pricing last reviewed</label>' +
+        '<input type="text" data-pe="scalar" data-f="reviewed" value="' + esc(p.reviewed || "") +
+        '" placeholder="30 June 2026"' + ro + "></div>" +
+        '<div class="spacer"></div><div class="small muted">These are Coastal\'s own prices, not a platform\'s. They travel with ' +
+        "the rate card, so pricing has one home and one thing to keep current. Advisers see the calculator, never this tab." +
+        "<br><br><strong>Load pricing</strong> replaces everything on this tab from a pasted sheet; <strong>Copy pricing</strong> " +
+        "hands the current one back out, which is worth doing as a backup before an annual repricing.</div>" },
+
+    { key: "p-lines", title: "Line items",
+      sub: "Every priced line, grouped by what it is",
+      meta: items.length + " line" + (items.length === 1 ? "" : "s"),
+      body: () => {
+        let html = "";
+        for (const sec of PRICE_SECTIONS) {
+          const rows = items.map((it, i) => ({ it, i })).filter(x => x.it.section === sec.id);
+          html += '<h3 style="font-size:.86rem;margin:16px 0 8px;color:var(--ink-2);letter-spacing:.06em;text-transform:uppercase">' +
+            esc(sec.group) + " &mdash; " + esc(sec.label) + "</h3>" +
+            addBtn('data-peadd="item" data-sec="' + sec.id + '"', "Add line");
+          html += rows.length
+            ? '<div class="tbl-scroll"><table><thead><tr><th>Line</th><th>Applies</th>' +
+              '<th class="num">NEW</th><th class="num">EXISTING</th><th>Cancels minimum</th>' +
+              (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+              rows.map(({ it, i }) =>
+                '<tr><td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="label" value="' +
+                  esc(it.label || "") + '"' + ro + "></td>" +
+                '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
+                  PRICE_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
+                    { min: "once", each: "per item", hour: "per hour" }[k] + "</option>").join("") + "</select></td>" +
+                '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+                  '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
+                '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+                  '" data-f="existingPrice" value="' + priceBox(it.existingPrice) + '" placeholder="n/a"' + ro + "></td>" +
+                '<td><input type="checkbox" data-pe="itemBool" data-i="' + i + '" data-f="suppressesMin"' +
+                  (it.suppressesMin ? " checked" : "") + ro + "></td>" +
+                del("item", i) + "</tr>").join("") + "</tbody></table></div>"
+            : '<div class="muted">No lines in this section.</div>';
+        }
+        return html +
+          '<div class="spacer"></div><div class="small muted">An empty price box means the line <strong>does not exist</strong> ' +
+          "for that client type &mdash; different from a price of zero, which is a real price of nothing. " +
+          "<strong>Once</strong> lines apply on their own with no quantity; <strong>cancels minimum</strong> marks a line that " +
+          "waives its section's once-line when it is used, which is how an insurance-only engagement escapes the base SOA fee.</div>";
+      } },
+
+    { key: "p-ladders", title: "FUM ladders",
+      sub: "Marginal bands, one ladder per client type",
+      meta: (ladders.NEW || []).length + " NEW · " + (ladders.EXISTING || []).length + " EXISTING",
+      warn: ((ladders.NEW || []).length && (ladders.EXISTING || []).length) ? "" : "a ladder is empty",
+      body: () => {
+        let html = '<div class="grid2 wide top">';
+        for (const ct of ["NEW", "EXISTING"]) {
+          const bands = ladders[ct] || [];
+          html += '<div><h3 style="font-size:.86rem;margin:0 0 8px;color:var(--ink-2)">' + ct + "</h3>" +
+            addBtn('data-peadd="ladder" data-ct="' + ct + '"', "Add band") +
+            (bands.length
+              ? '<div class="tbl-scroll"><table><thead><tr><th class="num">FUM above</th><th class="num">Rate</th>' +
+                (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+                bands.map((b, i) =>
+                  '<tr><td class="num"><input type="number" class="w110 num" data-pe="ladder" data-ct="' + ct +
+                    '" data-i="' + i + '" data-f="from" value="' + num(b.from) + '"' + ro + "></td>" +
+                  '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="ladder" data-ct="' + ct +
+                    '" data-i="' + i + '" data-f="rate" value="' + num(b.rate) + '"' + ro + ">" +
+                    '<div class="small muted">' + (num(b.rate) * 100).toFixed(2) + "%</div></td>" +
+                  del("ladder", i, ' data-ct="' + ct + '"') + "</tr>").join("") + "</tbody></table></div>"
+              : '<div class="muted">No bands, so FUM adds nothing for ' + ct + " clients.</div>") + "</div>";
+        }
+        return html + "</div>" +
+          '<div class="spacer"></div><div class="small muted">The same shape as the FUM surcharge on the other tab. ' +
+          "The first band is normally a rate of zero: it is the stretch of FUM the minimum fee already covers. " +
+          "Rates are decimals &mdash; <code>0.0088</code> is 0.88%.</div>";
+      } },
+
+    { key: "p-packages", title: "Service packages",
+      sub: "The tiers, and the Centrelink administration fee each carries",
+      meta: (p.packages || []).length + " package" + ((p.packages || []).length === 1 ? "" : "s"),
+      warn: (p.packages || []).length ? "" : "none set",
+      actions: addBtn('data-peadd="pack"', "Add package"),
+      body: () =>
+        '<div class="tbl-scroll"><table><thead><tr><th>Package</th><th class="num">Ongoing fee from</th>' +
+        '<th class="num">Centrelink admin</th><th class="num">Means tested</th>' + (ro ? "" : '<th class="no-print"></th>') +
+        "</tr></thead><tbody>" +
+        (p.packages || []).map((k, i) =>
+          '<tr><td><input type="text" class="grow-x" data-pe="pack" data-i="' + i + '" data-f="name" value="' +
+            esc(k.name || "") + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="from" value="' +
+            num(k.from) + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="cas" value="' +
+            num(k.cas) + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="mtf" value="' +
+            num(k.mtf) + '"' + ro + "></td>" + del("pack", i) + "</tr>").join("") +
+        '<tr><td class="muted">No agreement</td><td class="num muted">&mdash;</td>' +
+        '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="cas" value="' +
+          num((p.noCsa || {}).cas) + '"' + ro + "></td>" +
+        '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="mtf" value="' +
+          num((p.noCsa || {}).mtf) + '"' + ro + "></td>" + (ro ? "" : "<td></td>") + "</tr>" +
+        "</tbody></table></div>" +
+        '<div class="spacer"></div><div class="small muted">A client falls into the highest package their <strong>total ongoing ' +
+        "fee</strong> reaches. The two Centrelink columns are that package's administration fee &mdash; the second applies when " +
+        "the client needs quarterly means-tested updates. Neither is part of the Client Service Agreement.</div>" },
+
+    { key: "p-claims", title: "Insurance claims",
+      sub: "TPD benefit tiers, hourly rates, and the multi-claim discount",
+      meta: (cl.tiers || []).length + " tier" + ((cl.tiers || []).length === 1 ? "" : "s") +
+            " · " + (cl.rates || []).length + " rate" + ((cl.rates || []).length === 1 ? "" : "s"),
+      warn: ((cl.tiers || []).length && (cl.rates || []).length) ? "" : "incomplete",
+      body: () =>
+        '<div class="grid2 wide top">' +
+        '<div><h3 style="font-size:.86rem;margin:0 0 8px;color:var(--ink-2)">Claim fee tiers (TPD)</h3>' +
+        addBtn('data-peadd="tier"', "Add tier") +
+        ((cl.tiers || []).length
+          ? '<div class="tbl-scroll"><table><thead><tr><th class="num">Benefit above</th><th class="num">Rate</th>' +
+            (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+            cl.tiers.map((t, i) =>
+              '<tr><td class="num"><input type="number" class="w110 num" data-pe="tier" data-i="' + i +
+                '" data-f="from" value="' + num(t.from) + '"' + ro + "></td>" +
+              '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="tier" data-i="' + i +
+                '" data-f="rate" value="' + num(t.rate) + '"' + ro + ">" +
+                '<div class="small muted">' + (num(t.rate) * 100).toFixed(2) + "%</div></td>" +
+              del("tier", i) + "</tr>").join("") + "</tbody></table></div>"
+          : '<div class="muted">No claim tiers set.</div>') + "</div>" +
+
+        '<div><h3 style="font-size:.86rem;margin:0 0 8px;color:var(--ink-2)">Claim hourly rates</h3>' +
+        addBtn('data-peadd="crate"', "Add rate") +
+        ((cl.rates || []).length
+          ? '<div class="tbl-scroll"><table><thead><tr><th>Policy type</th><th class="num">Per hour</th>' +
+            '<th class="num">IP per month</th>' + (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+            cl.rates.map((r, i) =>
+              '<tr><td><input type="text" class="grow-x" data-pe="crate" data-i="' + i + '" data-f="label" value="' +
+                esc(r.label || "") + '"' + ro + "></td>" +
+              '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="hourly" value="' +
+                num(r.hourly) + '"' + ro + "></td>" +
+              '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="ipMonthly" value="' +
+                num(r.ipMonthly) + '"' + ro + "></td>" + del("crate", i) + "</tr>").join("") + "</tbody></table></div>"
+          : '<div class="muted">No hourly rates set.</div>') +
+        '<div class="spacer"></div><div class="field"><label>Multi-claim discount (fraction, e.g. 0.15)</label>' +
+        '<input type="number" step="0.01" data-pe="claimScalar" data-f="multiDiscount" value="' +
+          num(cl.multiDiscount) + '"' + ro + "></div></div></div>" },
+
+    { key: "p-ref", title: "Reference panels",
+      sub: "Preferred insurers and platforms, and the Centrelink criteria",
+      meta: refs.length + " panel" + (refs.length === 1 ? "" : "s"),
+      actions: addBtn('data-peadd="ref"', "Add panel"),
+      body: () =>
+        (refs.length
+          ? '<div class="grid2 wide top">' + refs.map((r, i) =>
+              '<div><input type="text" class="grow-x" data-pe="ref" data-i="' + i + '" data-f="title" value="' +
+                esc(r.title || "") + '" placeholder="Preferred platforms"' + ro + ">" +
+              '<div class="spacer" style="height:6px"></div>' +
+              '<textarea rows="6" style="width:100%" data-pe="ref" data-i="' + i + '" data-f="body"' + ro + ">" +
+                esc(r.body || "") + "</textarea>" +
+              (ro ? "" : '<button class="btn ghost btn-sm" data-pedel="ref" data-i="' + i + '">Remove panel</button>') +
+              "</div>").join("") + "</div>"
+          : '<div class="muted">No reference panels.</div>') +
+        '<div class="spacer"></div><div class="small muted">Shown at the bottom of the Pricing Calculator. This is where the ' +
+        "preferred insurer and platform lists live, and the Centrelink simple/complex criteria &mdash; which list something " +
+        "falls on is what decides which price applies.</div>" }
+  ];
 }
 
 /* "Marginal" is a word people nod at and then get wrong, so show it happening on
@@ -5288,7 +5475,9 @@ function surchargeWorkedExample(rc) {
    The most each platform will let us draw from an account. Not Coastal pricing:
    these are the platforms' own limits, so the table is a record of what they
    have told us rather than anything we decide. */
-function fundCapCard() {
+/* The body of the Fund fee caps section — its header, its total and its Add
+   button are the section wrapper's job now. */
+function fundCapBody() {
   const ro = can("rateCardEdit") ? "" : " disabled";
   const c = state.calc;
   /* How many accounts in the loaded run each fund is actually matching, so a
@@ -5296,12 +5485,7 @@ function fundCapCard() {
   const hits = new Map();
   if (c) for (const r of c.rows) if (r.fund) hits.set(r.fund.name, (hits.get(r.fund.name) || 0) + 1);
 
-  let html = '<div class="spacer"></div><div class="card"><div class="card-h"><h2>Fund fee caps</h2>' +
-    '<div class="sub">The most each platform will let us draw from an account</div>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnAddFund">Add fund</button></div>') +
-    '</div><div class="card-b">';
-
-  html += '<ul class="small muted" style="margin:0 0 14px;padding-left:18px;line-height:1.65">' +
+  let html = '<ul class="small muted" style="margin:0 0 14px;padding-left:18px;line-height:1.65">' +
     "<li><strong>Cap % and Cap $</strong> &mdash; set either, or both. With both, the <strong>lower</strong> of the two binds, " +
       "which is how &ldquo;2.20% pa, capped at $18,000&rdquo; reads. Percentages are typed as written: <code>2.2</code> means 2.20%. " +
       "A platform with no cap gets <code>0</code> in both, and still needs a row.</li>" +
@@ -5320,8 +5504,8 @@ function fundCapCard() {
     "</ul>";
 
   if (!state.funds.length) {
-    html += '<div class="muted">No funds yet. ' + (ro ? "A Manager or Admin can add them." : "Add the platforms you deal with, or connect to SharePoint and they load from the list.") + "</div>";
-    return html + "</div></div>";
+    return html + '<div class="muted">No funds yet. ' +
+      (ro ? "A Manager or Admin can add them." : "Add the platforms you deal with, or connect to SharePoint and they load from the list.") + "</div>";
   }
 
   html += '<div class="tbl-wrap"><table><thead><tr><th>Fund</th><th>Also matched on</th>' +
@@ -5389,22 +5573,19 @@ function fundCapCard() {
       esc([...new Set(c.noPlatform.map(r => r.subfundName))].slice(0, 6).join(" · ")) +
       (new Set(c.noPlatform.map(r => r.subfundName)).size > 6 ? " …" : "") + "</div></div>";
   }
-  return html + "</div></div>";
+  return html;
 }
 
 /* Xplan hands us a category code; the rate card holds tier names. This is where
    the two are reconciled. Kept separate from the rate table itself so nobody has
    to invent duplicate tiers just to get a code to price. */
-function categoryMappingCard() {
+function categoryMappingBody() {
   const c = state.calc, rc = state.rateCard;
   const ro = !can("rateCardEdit") ? " disabled" : "";
-  if (!c) return '<div class="spacer"></div><div class="banner info">Load a run to map its categories.</div>';
+  if (!c) return '<div class="muted">Load a run to map its categories.</div>';
 
   const options = rc.categories.map(x => x.name);
-  let html = '<div class="spacer"></div><div class="card"><div class="card-h"><h2>Category mapping</h2>' +
-    '<div class="sub">What each Xplan <em>Master Category</em> means on the current rate card</div>' +
-    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnClearMap">Clear all mappings</button></div>') + "</div>" +
-    '<div class="card-b"><div class="banner warn" style="margin-bottom:14px">The letter codes changed meaning between the old and new ' +
+  let html = '<div class="banner warn" style="margin-bottom:14px">The letter codes changed meaning between the old and new ' +
     'tables &mdash; old <strong>B</strong> was Exclusive, new <strong>B</strong> is Platinum; old <strong>C</strong> was Platinum, new ' +
     '<strong>C</strong> is Essential. Xplan codes were stamped under the old scheme, so map them deliberately rather than letting the ' +
     'name match do it.</div>' +
@@ -5425,8 +5606,7 @@ function categoryMappingCard() {
       '<td class="num">' + (e.rate == null ? '<span class="muted">&mdash;</span>' : money(e.rate)) + "</td>" +
       "<td>" + stateCell + "</td></tr>";
   }
-  html += "</tbody></table></div></div>";
-  return html;
+  return html + "</tbody></table>";
 }
 
 /* ---------------- Advisers ---------------- */
@@ -5974,6 +6154,42 @@ function wire() {
         saveRateCard(); render();
         toast(state.rateCard.pricing.items.length + " pricing lines loaded.", "good");
       }));
+
+  /* --- folding sections and their index tiles, on Settings and Exceptions ---
+     One pair of handlers for both screens; `store` says which state object the
+     open/closed flags live in. */
+  const foldWire = (foldAttr, jumpAttr, store) => {
+    document.querySelectorAll("[" + foldAttr + "]").forEach(el => {
+      const key = el.getAttribute(foldAttr);
+      /* Read the rendered state rather than the stored flag: a section with a
+         warning opens with nothing stored against it, and `!undefined` would
+         leave it open on the first click. */
+      const toggle = () => { store[key] = el.getAttribute("aria-expanded") !== "true"; render(); };
+      el.addEventListener("click", toggle);
+      /* A div doing a button's job still needs a button's keys. */
+      el.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+      });
+    });
+    document.querySelectorAll("[" + jumpAttr + "]").forEach(el =>
+      el.addEventListener("click", () => {
+        const key = el.getAttribute(jumpAttr);
+        store[key] = true;
+        render();
+        /* After the rebuild, not before — the section may not have existed. */
+        const card = document.getElementById(foldAttr === "data-rcfold" ? "rcs-" + key : "exs-" + key);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "start" });
+          card.classList.add("jumped");
+          setTimeout(() => card.classList.remove("jumped"), 1200);
+        }
+      }));
+  };
+  foldWire("data-rcfold", "data-rcjump", state.rcOpen);
+  foldWire("data-exfold", "data-exjump", state.exOpen);
+
+  document.querySelectorAll("[data-rctab]").forEach(el =>
+    el.addEventListener("click", () => { state.rcTab = el.dataset.rctab; render(); }));
 
   /* --- rate card --- */
   document.querySelectorAll('[data-rc="cat"],[data-rc="wt"],[data-rc="band"]').forEach(el =>
