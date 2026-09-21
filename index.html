@@ -1618,7 +1618,13 @@ function fundToFields(f) {
    they are split on the way out by whose client each one touches. */
 function partitionOverrides(run) {
   const owner = new Map();
-  if (state.calc) for (const m of state.calc.masters) owner.set(m.masterId, m.adviser || "");
+  /* Removed clients are out of `masters`, so they have to be added back here or
+     the very override that removed them would be filed under "(unassigned)" and
+     written to a row nobody reads. */
+  if (state.calc) {
+    for (const m of state.calc.masters) owner.set(m.masterId, m.adviser || "");
+    for (const m of state.calc.removed || []) owner.set(m.masterId, m.adviser || "");
+  }
   const bucket = new Map();
   const put = (adviser, k, v) => {
     if (!bucket.has(adviser)) bucket.set(adviser, {});
@@ -1629,7 +1635,15 @@ function partitionOverrides(run) {
     let masterId = "";
     if (k.startsWith("master:") || k.startsWith("add:")) masterId = body;
     else if (k.startsWith("row:")) {
-      masterId = body.startsWith("add~") ? (masterOfAddedFund(body.slice(4)) || "") : body.split("~")[1] || "";
+      masterId = body.startsWith("add~") ? (masterOfAddedFund(body.slice(4)) || "")
+               : body.startsWith("newc~") ? ((run.overrides["client:" + body.slice(5)] || {}).masterId || "")
+               : body.split("~")[1] || "";
+    }
+    /* An added client is keyed by its uid, not its master id, so its adviser is
+       read straight off the record rather than looked up. */
+    if (k.startsWith("client:")) {
+      put((run.overrides[k] || {}).adviser || "(unassigned)", k, run.overrides[k]);
+      continue;
     }
     put(owner.get(masterId) || "(unassigned)", k, run.overrides[k]);
   }
@@ -1963,7 +1977,8 @@ function regionalManagersFor(adviserName) {
    can never disagree about whether a book needs looking at. */
 function checkSummaryFor(adviser) {
   const ms = (state.calc ? state.calc.masters : []).filter(m => m.adviser === adviser);
-  const att = attentionFor(ms);
+  const gone = (state.calc ? state.calc.removed : []).filter(m => m.adviser === adviser);
+  const att = attentionFor(ms, gone);
   return { needsCheck: att.total > 0,
            summary: att.total ? att.parts.map(p => p.label).join(", ") : "Nothing flagged." };
 }
@@ -2064,6 +2079,7 @@ async function notifySubmitted(run, adviser) {
   if (!mgrs.length) return;
   const chk = checkSummaryFor(adviser);
   const ms = (state.calc ? state.calc.masters : []).filter(m => m.adviser === adviser);
+  const gone = (state.calc ? state.calc.removed : []).filter(m => m.adviser === adviser);
   const cur = ms.reduce((a, m) => a + (m.currentFee || 0), 0);
   const nw = ms.reduce((a, m) => a + (m.fee || 0), 0);
   await sendNotifications([notifyRow({
@@ -2071,12 +2087,19 @@ async function notifySubmitted(run, adviser) {
     to: mgrs.map(m => m.email).join(";"),
     needsCheck: chk.needsCheck, checkSummary: chk.summary,
     /* A line each, because this is the one message somebody skims to decide
-       whether to open the run at all. */
+       whether to open the run at all. A removed client is named in full here
+       rather than counted: it is the only change that leaves no trace in the
+       totals, so the email is where it has to be legible. */
     message: adviser + " has completed " + monthLabel(run.key) + ".\n\n" +
       "Clients: " + ms.length + "\n" +
       "Current fees: " + money(cur) + "\n" +
       "New fees: " + money(nw) + "\n" +
       "Movement: " + signed(nw - cur) + "\n\n" +
+      (gone.length
+        ? gone.length + " client" + (gone.length === 1 ? "" : "s") + " removed from the review:\n" +
+          gone.map(m => "- " + m.name + " (" + money(m.currentFee) + "): " +
+            (m.removeNote || "no reason given")).join("\n") + "\n\n"
+        : "") +
       (chk.needsCheck ? "Needs a look: " + chk.summary : "Nothing flagged.")
   })]);
 }
@@ -2713,6 +2736,25 @@ function calculate(run) {
      the screen is currently showing. */
   let rows = run.rows.map((r, i) => ({ ...r, key: rowKey(r, i), i }));
 
+  /* Clients the adviser added by hand, for someone who should be in the review
+     and is not in the extract. One seed row each, so a master exists for the
+     rest of the machinery to hang off — including the added-fund code below,
+     which needs a prototype row to copy an identity from. Pushed before the
+     prototype map is built, for exactly that reason. */
+  for (const k of Object.keys(overrides)) {
+    if (k.slice(0, 7) !== "client:") continue;
+    const a = overrides[k] || {};
+    rows.push({
+      groupId: "N/A", masterId: a.masterId, masterName: a.name,
+      memberId: a.masterId, memberName: a.name,
+      adviser: a.adviser || "", category: a.category || "", entityCat: "-",
+      subfundName: "- Default", vendor: "N/A", value: 0,
+      currentFee: num(a.currentFee),
+      key: "newc~" + k.slice(7), i: rows.length, manualClient: true,
+      addedBy: a.addedBy || "", addedAt: a.addedAt || ""
+    });
+  }
+
   /* Funds the adviser added by hand. They inherit the client's identity so they
      land in the right FUM group, and carry a uid so removing one does not
      re-point the overrides of the others. */
@@ -2815,7 +2857,7 @@ function calculate(run) {
 
   const unpricedCats = new Map();
   const unknownAdvisers = new Set();
-  const out = [];
+  let out = [];
 
   for (const m of masters.values()) {
     m.totalFum = fum.get(m.fumKey) || 0;
@@ -2850,6 +2892,24 @@ function calculate(run) {
     const ov = overrides["master:" + m.masterId] || {};
     m.pctInput = ov.pctInput != null ? num(ov.pctInput) : null;                 // AB, when typed over
     m.comment = ov.comment || "";                                               // AM
+    /* Taken out of this month's review by the adviser. The client stays in the
+       extract — this is an override, not a deletion — but drops out of every
+       total, and the note is the reason the manager reads. */
+    m.removed = !!ov.removed;
+    m.removeNote = ov.removeNote || "";
+    /* Added by an adviser rather than read out of the extract — worth saying so
+       wherever they appear, since nothing upstream knows about them. */
+    const seed = m.rows.find(r => r.manualClient);
+    m.addedByHand = !!seed;
+    m.addedBy = seed ? seed.addedBy : "";
+    /* Who left what. Anyone with a run open can edit a comment now, so the note
+       and its author are no longer the same person by definition. */
+    m.trail = ov.trail || [];
+    const lastNote = [...m.trail].reverse().find(t => t.kind === "comment");
+    m.commentBy = (m.comment && lastNote && lastNote.text === m.comment) ? lastNote.by : "";
+    const lastGone = [...m.trail].reverse().find(t => t.kind === "removed");
+    m.removedBy = lastGone ? lastGone.by : "";
+    m.removedAt = lastGone ? lastGone.at : "";
 
     /* S / AL — how the client is priced and where the money comes from are no
        longer chosen on the client line; they are read back from what has
@@ -3084,6 +3144,13 @@ function calculate(run) {
 
   out.sort((a, b) => (a.adviser || "").localeCompare(b.adviser || "") || (a.name || "").localeCompare(b.name || ""));
 
+  /* Removed clients come out here rather than being filtered at every reader.
+     Everything downstream — totals, exceptions, approvals, the report, the CSV
+     — works off `masters`, so one split keeps them out of all of it, and
+     `removed` is what the screens that must show them read instead. */
+  const removed = out.filter(m => m.removed);
+  out = out.filter(m => !m.removed);
+
   /* Every category the extract contains, with how it is currently resolving.
      This is what the mapping screen and the ambiguity check both read. */
   const catSeen = new Map();
@@ -3102,7 +3169,7 @@ function calculate(run) {
     e.pricedVia === "direct" && /^[A-F]$/i.test(String(e.category).trim()));
 
   return {
-    rows, masters: out,
+    rows, masters: out, removed,
     categories: [...catSeen.values()].sort((a, b) => b.clients - a.clients),
     ambiguous,
     unpricedCats: [...unpricedCats.entries()].sort((a, b) => b[1] - a[1]),
@@ -3245,6 +3312,53 @@ async function openRun(key) {
     catch (e) { toast("Could not load " + monthLabel(key) + ". " + ((e && e.message) || e), "bad"); }
   }
   render();
+}
+
+/* Who to record against a note. Connected, this is the signed-in person. In
+   local mode there is nobody to be, so it falls back to whoever the role
+   switcher is standing in as — which is honest about what local mode is. */
+function noteAuthor() {
+  const id = state.identity;
+  if (id && id.name) return id.name;
+  if (can("ownBook") && state.asAdviser) return state.asAdviser;
+  return state.role || "Unknown";
+}
+
+/* Returns the trail a client would have after this entry, or null when the
+   entry repeats the one before it — a comment box fires on every change, and an
+   entry identical to its predecessor is noise rather than history.
+   Returned rather than written so the caller folds it into one save. */
+function trailWith(masterId, kind, text) {
+  const run = currentRun();
+  if (!run) return null;
+  const cur = run.overrides["master:" + masterId] || {};
+  const trail = (cur.trail || []).slice();
+  const last = trail[trail.length - 1];
+  if (last && last.kind === kind && last.text === (text || "")) return null;
+  trail.push({ at: new Date().toISOString(), by: noteAuthor(), kind, text: text || "" });
+  /* Bounded. A comment edited twenty times is not twenty pieces of history, and
+     the whole run's overrides have to fit in one SharePoint column. */
+  return trail.slice(-12);
+}
+
+const TRAIL_VERB = { comment: "commented", removed: "removed from the review", restored: "put back in the review" };
+
+/* The history under an expanded client. Reads as a list of things people did,
+   because that is what somebody opening it wants to know. */
+function trailPanel(m, span) {
+  if (!m.trail || !m.trail.length) return "";
+  const when = iso => {
+    const d = new Date(iso);
+    return isNaN(d) ? "" : d.toLocaleDateString("en-AU", { day: "numeric", month: "short" }) +
+      " " + d.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit" });
+  };
+  return '<tr class="acct"><td></td><td colspan="' + (span - 1) + '">' +
+    '<div class="small muted" style="font-weight:600;margin-bottom:4px">History</div>' +
+    [...m.trail].reverse().map(t =>
+      '<div class="small muted">' + esc(when(t.at)) + " &middot; <strong>" + esc(t.by) + "</strong> " +
+      esc(TRAIL_VERB[t.kind] || t.kind) +
+      (t.text ? ": &ldquo;" + esc(t.text) + "&rdquo;" : "") + "</div>").join("") +
+    "</td></tr>";
 }
 
 function setOverride(scope, id, patch) {
@@ -3787,6 +3901,7 @@ function viewReview() {
     regions.map(a => '<option value="' + esc(a) + '"' + (state.filterRegion === a ? " selected" : "") + ">" + esc(a) + "</option>").join("") + "</select></div>" +
     searchField() +
     '<div class="right no-print">' +
+    (locked ? "" : '<button class="btn ghost" id="btnAddClient">+ Add client</button>') +
     '<button class="btn ghost" id="btnPrint">Report / PDF</button>' +
     '<button class="btn ghost" id="btnCsv">Export CSV</button></div></div>';
 
@@ -3796,6 +3911,14 @@ function viewReview() {
     (locked ? ' &middot; <span class="pill warn">run locked — read only</span>' : "") + "</div></div>";
 
   html += clientTable(list, locked);
+  /* Removals follow the adviser and region filters, so a manager looking at one
+     adviser sees that adviser's removals and no others. Not the search box —
+     searching narrows the table, and a removal hiding behind a search term is
+     a removal nobody reads. */
+  let gone = c.removed;
+  if (state.filterAdviser !== "all") gone = gone.filter(m => m.adviser === state.filterAdviser);
+  if (state.filterRegion !== "all") gone = gone.filter(m => m.region === state.filterRegion);
+  html += removedPanel(gone, locked);
   return html;
 }
 
@@ -3873,6 +3996,7 @@ function viewMyClients() {
     " &rarr; new " + money(totNew) + "</div>" +
     searchField() +
     '<div class="right no-print">' +
+    (locked ? "" : '<button class="btn ghost" id="btnAddClient">+ Add client</button>') +
     '<button class="btn ghost" id="btnPrint">Report / PDF</button>' +
     '<button class="btn ghost" id="btnCsv">Export CSV</button>' +
     (locked ? "" : '<button class="btn sky" id="btnSubmit">Submit for approval</button>') +
@@ -3886,7 +4010,32 @@ function viewMyClients() {
       shown.length + " of " + list.length + ' clients match &ldquo;' + esc(state.query.trim()) + "&rdquo;</div>";
   }
   html += clientTable(shown, locked);
+  html += removedPanel(c.removed.filter(m => m.adviser === me), locked);
   return html;
+}
+
+/* Clients taken out of the review. Shown rather than hidden, because a removal
+   is a decision the adviser has to be able to see, undo and be asked about —
+   and because the manager reads these before approving. */
+function removedPanel(list, locked) {
+  if (!list.length) return "";
+  return '<div class="spacer"></div><div class="card"><div class="card-h"><h2>Removed from this review</h2>' +
+    '<div class="sub">' + list.length + " client" + (list.length === 1 ? "" : "s") +
+    " &middot; not in any total, and listed for your regional manager with the reason</div></div>" +
+    '<div class="card-b"><div class="tbl-scroll"><table><thead><tr><th>Master client</th>' +
+    '<th class="num">Current fee</th><th>Why it was removed</th>' +
+    (locked ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+    list.map(m => "<tr><td>" + esc(m.name) +
+      '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+      '<td class="num">' + money(m.currentFee) + "</td>" +
+      "<td>" + (m.removeNote ? esc(m.removeNote) : '<span class="muted">no reason given</span>') +
+        (m.removedBy ? '<div class="small muted">&mdash; ' + esc(m.removedBy) +
+          (m.removedAt ? ", " + esc(new Date(m.removedAt).toLocaleDateString("en-AU", { day: "numeric", month: "short" })) : "") +
+          "</div>" : "") + "</td>" +
+      (locked ? "" : '<td class="no-print"><button class="btn ghost btn-sm" data-restoreclient="' +
+        esc(m.masterId) + '">Put back</button></td>') +
+      "</tr>").join("") +
+    "</tbody></table></div></div></div>";
 }
 
 /* The shared table. Ops and advisers see the same numbers — the difference is
@@ -3933,6 +4082,8 @@ function clientTable(list, locked) {
          big. The ID gets a line of its own because it is what gets copied into
          Xplan, and hunting for it inside a run-on line is the whole problem. */
       "<td><strong>" + esc(m.name) + "</strong>" +
+        (m.addedByHand ? ' <span class="pill info" title="Not in the Xplan extract' +
+          (m.addedBy ? " — added by " + esc(m.addedBy) : "") + '">added</span>' : "") +
         '<div class="small muted mono">Xplan ' + esc(m.masterId) + "</div>" +
         '<div class="small muted">' + m.rows.length + " accounts" + (added.length ? " (" + added.length + " added)" : "") +
         (m.entityWeightTotal ? " &middot; +" + m.entityWeightTotal + " entity wt" : "") + "</div></td>" +
@@ -3951,7 +4102,10 @@ function clientTable(list, locked) {
       '<td class="num">' + money(m.variance) + "</td>" +
       "<td>" + paymentCell(m) + "</td>" +
       '<td><textarea rows="1" class="grow w140" data-mo="' + esc(m.masterId) + '" data-f="comment"' + (locked ? " disabled" : "") + ">" +
-        esc(m.comment) + "</textarea></td>" +
+        esc(m.comment) + "</textarea>" +
+        /* Who wrote what is on screen now. The rest of the history is under the
+           client, where there is room for it. */
+        (m.commentBy ? '<div class="small muted">&mdash; ' + esc(m.commentBy) + "</div>" : "") + "</td>" +
       "</tr>";
 
     if (open) {
@@ -3983,11 +4137,13 @@ function clientTable(list, locked) {
       if (!locked) {
         html += '<tr class="acct no-print"><td></td><td colspan="' + (span - 1) + '">' +
           '<button class="btn ghost btn-sm" data-addfund="' + esc(m.masterId) + '">+ Add fund</button> ' +
-          '<button class="btn ghost btn-sm" data-payall="' + esc(m.masterId) + '">Set payment on all funds&hellip;</button>' +
+          '<button class="btn ghost btn-sm" data-payall="' + esc(m.masterId) + '">Set payment on all funds&hellip;</button> ' +
+          '<button class="btn ghost btn-sm" data-removeclient="' + esc(m.masterId) + '">Remove client&hellip;</button>' +
           (m.fundsPriced ? ' <span class="small muted">priced by fund &mdash; the client fee is the sum of ' +
             m.fundsPriced + " of " + m.rows.filter(r => r.included).length + " funds</span>" : "") +
           "</td></tr>";
       }
+      html += trailPanel(m, span);
     }
   }
   html += "</tbody></table></div></div>";
@@ -4278,6 +4434,27 @@ function viewExceptions() {
           }).join("") + "</tbody></table>"
         : none("Every category in this run has a rate. Nothing to do.") },
 
+    /* Red, and so open by default: it is the only change on this screen that
+       leaves no trace in the totals, so a folded one is one nobody sees. */
+    { key: "removed", tone: "bad", count: c.removed.length, note: "clients",
+      tile: "Removed from the review", title: "Clients removed from this review",
+      sub: "Taken out by their adviser, with the reason they gave. Out of every total on every other screen.",
+      body: () => c.removed.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Current fee</th>' +
+          '<th class="num">FUM</th><th>Why</th></tr></thead><tbody>' +
+          c.removed.map(m => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+            "<td>" + esc(m.adviser) + '</td><td class="num">' + money(m.currentFee) +
+            '</td><td class="num">' + money(m.totalFum) + "</td>" +
+            "<td>" + (m.removeNote ? esc(m.removeNote) : '<span class="muted">no reason given</span>') +
+            (m.removedBy ? '<div class="small muted">&mdash; ' + esc(m.removedBy) +
+              (m.removedAt ? ", " + esc(new Date(m.removedAt).toLocaleDateString("en-AU", { day: "numeric", month: "short" })) : "") +
+              "</div>" : "") +
+            "</td></tr>").join("") + "</tbody></table>" +
+          '<div class="spacer"></div><div class="small muted">Removing a client takes their current fee out of the ' +
+          "month's totals as well as their new one, so a month with removals will not reconcile against the raw extract. " +
+          "That is the intent &mdash; but it is why the reason matters.</div>"
+        : none("No client has been taken out of this review.") },
+
     { key: "ambiguous", tone: "warn", count: c.ambiguous.length, note: "codes",
       tile: "Codes to confirm", title: "Category codes worth confirming",
       sub: "Priced by name match, but the same code meant a different tier on the old table",
@@ -4479,7 +4656,7 @@ function viewApprovals() {
     const st = adviserState(a);
     const dir = state.advisers.find(x => x.name === a);
     const open = !!state.expandedAdviser[a];
-    const att = attentionFor(ms);
+    const att = attentionFor(ms, (c.removed || []).filter(m => m.adviser === a));
 
     html += '<tr><td><button class="expand" data-expa="' + esc(a) + '">' + (open ? "&minus;" : "+") + "</button></td>" +
       "<td><strong>" + esc(a) + "</strong>" + (dir && dir.email ? '<div class="small muted">' + esc(dir.email) + "</div>" : "") + "</td>" +
@@ -4515,15 +4692,20 @@ function viewApprovals() {
 /* What a manager is actually scanning for. Deliberately the same three things
    the completion email will report, so the screen and the email never disagree
    about whether an adviser's book needs looking at. */
-function attentionFor(ms) {
+/* `removed` is passed separately because removed clients are deliberately not in
+   `masters` — and a client taken out of the month is the one thing here a
+   manager most needs told about, since it is invisible everywhere else. */
+function attentionFor(ms, removed) {
   const parts = [];
   const band = ms.filter(m => m.outsideBand).length;
   const platform = ms.filter(m => m.overCap || m.underMinBalance.length).length;
   const below = ms.filter(m => m.belowCurrent).length;
+  const gone = (removed || []).length;
+  if (gone) parts.push({ label: gone + " removed", cls: "bad" });
   if (band) parts.push({ label: band + " off band", cls: "warn" });
   if (platform) parts.push({ label: platform + " platform issue" + (platform > 1 ? "s" : ""), cls: "bad" });
   if (below) parts.push({ label: below + " below current", cls: "bad" });
-  return { parts, total: band + platform + below };
+  return { parts, total: gone + band + platform + below };
 }
 
 /* The adviser's book, inline. Read-only on purpose: this screen is for deciding
@@ -5841,7 +6023,10 @@ function wire() {
       let v = el.value;
       if (f === "pctInput") v = v === "" ? null : num(v) / 100;
       else if (f === "fee") v = v === "" ? null : num(v);
-      setOverride("master", el.dataset.mo, { [f]: v });
+      /* A comment records who left it. Folded into the same patch so it is one
+         save, not two. */
+      const t = f === "comment" ? trailWith(el.dataset.mo, "comment", String(v || "").trim()) : null;
+      setOverride("master", el.dataset.mo, t ? { [f]: v, trail: t } : { [f]: v });
       markInProgress();
       render();
     });
@@ -6011,6 +6196,24 @@ function wire() {
       () => toast(outstanding.length + " advisers copied to the clipboard."),
       () => toast("Could not copy — clipboard blocked.", "bad"));
   });
+
+  /* --- adding and removing clients --- */
+  document.querySelectorAll("[data-removeclient]").forEach(el =>
+    el.addEventListener("click", () => openRemoveClientDialog(el.dataset.removeclient)));
+  if ($("#btnAddClient")) $("#btnAddClient").addEventListener("click", openAddClientDialog);
+  document.querySelectorAll("[data-restoreclient]").forEach(el =>
+    el.addEventListener("click", () => {
+      const id = el.dataset.restoreclient;
+      const m = (state.calc.removed || []).find(x => x.masterId === id);
+      /* The note goes with the removal — it describes a decision that no longer
+         stands, and leaving it behind would put a stale reason in front of the
+         manager on the next removal. The history keeps it. */
+      setOverride("master", id, { removed: null, removeNote: null,
+        trail: trailWith(id, "restored", (m && m.removeNote) || "") || undefined });
+      markInProgress();
+      render();
+      toast((m ? m.name : "Client") + " is back in the review.");
+    }));
 
   /* --- pricing calculator ---
      Quantities and amounts repaint in place on every keystroke. Anything that
@@ -6468,6 +6671,105 @@ function openImportDialog(fileName, recs, missing) {
 /* An account Xplan does not know about — a new platform, or one the extract
    missed. It joins the client's FUM group, so it changes the surcharge and every
    other fund's share of the fee, which is the point. */
+/* Taking a client out of the review. The note is not optional: a client that
+   vanishes from a month with no reason is the one thing a manager cannot check,
+   and the note is what reaches them. */
+function openRemoveClientDialog(masterId) {
+  const m = state.calc.masters.find(x => x.masterId === masterId);
+  if (!m) return;
+
+  const body =
+    '<div class="kv" style="margin-bottom:16px">' +
+    '<div class="k">Client</div><div class="v">' + esc(m.name) + "</div>" +
+    '<div class="k">Xplan ID</div><div class="v mono">' + esc(m.masterId) + "</div>" +
+    '<div class="k">Accounts</div><div class="v">' + m.rows.length + "</div>" +
+    '<div class="k">FUM</div><div class="v">' + money(m.totalFum) + "</div>" +
+    '<div class="k">Current fee</div><div class="v">' + money(m.currentFee) + "</div></div>" +
+    '<p class="small muted">They drop out of every total and out of your submission. Nothing is deleted &mdash; ' +
+    "they are listed under <strong>Removed from this review</strong>, where you can put them back, and your " +
+    "regional manager sees them there with the reason below.</p>" +
+    '<div class="field"><label>Why is this client not part of the review?</label>' +
+    '<textarea id="rcNote" rows="3" style="width:100%" placeholder="e.g. Left the firm in August, fee already switched off"></textarea></div>' +
+    '<div class="small muted" style="margin-top:6px">Required.</div>';
+
+  showDialog("Remove " + m.name + " from this review", body, "Remove client", () => {
+    const note = ($("#rcNote").value || "").trim();
+    if (note.length < 5) {
+      toast("Give a reason — your regional manager sees this instead of the client.", "bad");
+      const box = $("#rcNote"); if (box) box.focus();
+      return false;
+    }
+    setOverride("master", masterId, { removed: true, removeNote: note,
+      trail: trailWith(masterId, "removed", note) || undefined });
+    markInProgress();
+    render();
+    toast(m.name + " removed from this review.");
+  });
+}
+
+/* A client who should be in the month and is not in the extract. Held as an
+   override like everything else, so a re-import does not lose them and they
+   travel with the rest of the adviser's work. */
+function openAddClientDialog() {
+  const cats = (state.rateCard.categories || []).map(x => x.name);
+  /* An adviser adds to their own book and is not asked. Anybody else has to say
+     whose client it is, because the answer decides who reviews it and who is
+     chased for it. */
+  const mine = scopedAdviser();
+  const choices = [...new Set(
+    advisersInRun().concat(state.advisers.filter(a => a.active !== false && a.role === "Adviser").map(a => a.name))
+  )].sort();
+
+  const body =
+    '<p class="small muted">For somebody who should be in this month and is not in the data. ' +
+    "Add their accounts afterwards with <strong>+ Add fund</strong>, the same as any other client.</p>" +
+    (mine ? "" :
+      '<div class="field"><label>Adviser</label><select id="acAdviser"><option value="">(choose an adviser)</option>' +
+      choices.map(a => '<option value="' + esc(a) + '">' + esc(a) + "</option>").join("") +
+      "</select></div><div class=\"spacer\"></div>") +
+    '<div class="field"><label>Client name</label>' +
+    '<input type="text" id="acName" placeholder="Surname, First"></div>' +
+    '<div class="spacer"></div><div class="field"><label>Xplan ID</label>' +
+    '<input type="text" id="acId" placeholder="e.g. 5221894"></div>' +
+    '<div class="spacer"></div><div class="field"><label>Category</label>' +
+    '<select id="acCat"><option value="">(none &mdash; will show as no rate)</option>' +
+    cats.map(x => '<option value="' + esc(x) + '">' + esc(x) + "</option>").join("") + "</select></div>" +
+    '<div class="spacer"></div><div class="field"><label>Current fee</label>' +
+    '<input type="number" step="1" id="acFee" value="0"></div>' +
+    '<div class="small muted" style="margin-top:10px">They are added to your book and show like any other client. ' +
+    "A hand-added client is marked as such wherever they appear.</div>";
+
+  showDialog("Add a client to this review", body, "Add client", () => {
+    const name = ($("#acName").value || "").trim();
+    if (!name) { toast("Give the client a name.", "bad"); return false; }
+    const adviser = mine || ($("#acAdviser") ? $("#acAdviser").value : "");
+    if (!adviser) { toast("Choose which adviser this client belongs to.", "bad"); return false; }
+    const typed = ($("#acId").value || "").trim();
+    const run = currentRun();
+    /* A hand-typed id that collides with an existing one would merge the two
+       clients silently, so it is checked rather than trusted — against removed
+       clients too, since those are still in the run. */
+    if (typed && state.calc.masters.concat(state.calc.removed || []).some(x => x.masterId === typed)) {
+      toast("Xplan ID " + typed + " is already in this run.", "bad");
+      return false;
+    }
+    const uid = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    run.overrides["client:" + uid] = {
+      masterId: typed || "NEW-" + uid,
+      name, adviser,
+      category: $("#acCat").value || "",
+      currentFee: num($("#acFee").value),
+      addedBy: noteAuthor(),
+      addedAt: new Date().toISOString()
+    };
+    saveRuns();
+    recalc();
+    markInProgress();
+    render();
+    toast(name + " added. Use + Add fund to give them accounts.", "good");
+  });
+}
+
 function openAddFundDialog(masterId) {
   const m = state.calc.masters.find(x => x.masterId === masterId);
   if (!m) return;
