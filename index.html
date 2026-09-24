@@ -683,7 +683,17 @@ const OPTIONAL_LISTS = ["notifications"];
 const NOTIFY_KINDS = ["Review ready", "Reminder", "Completed", "Approved", "Returned"];
 const NOTIFY_STATUS = ["Scheduled", "Queued", "Sent", "Failed", "Cancelled"];
 const REMINDER_DAYS = 7;
+/* Goes on every message that asks an adviser to work through their book, so it
+   lives here rather than being typed into each of them. Left off a returned
+   review deliberately — that one is about fixing what came back, not about
+   which clients get an offer. */
+const REVIEW_OFFER_LINE =
+  "Any clients who do not need the review offer sent out, please reply to this email.";
 const DOC_LIBRARY = "Fee Calculator Data";
+/* SharePoint's multi-line text ceiling is 63,999 characters. Stopping short of
+   it leaves room for the field names around the JSON and for a book that grows
+   between one save and the next. */
+const OVERRIDES_LIMIT = 60000;
 
 /* The choice values these lists carry. Declared here rather than beside the code
    that uses them because the schema audit below has to know them too. */
@@ -1917,7 +1927,30 @@ async function writeRun() {
   sp.lastOverride[key] = sp.lastOverride[key] || {};
   for (const [adviser, ov] of partitionOverrides(run)) {
     const st = run.adviserStatus[adviser] || { status: "Not started" };
-    const json = JSON.stringify(ov);
+    let json = JSON.stringify(ov);
+
+    /* One adviser's whole book lives in one 63,999 character column, and an
+       oversized write is rejected outright — which would lose the work rather
+       than part of it. So when it will not fit, history goes first: it is the
+       only part nobody priced a client on. The fees, comments and payment
+       sources are the work and are never dropped. */
+    if (json.length > OVERRIDES_LIMIT) {
+      const lean = JSON.parse(json);
+      let dropped = 0;
+      for (const k of Object.keys(lean)) {
+        if (lean[k] && lean[k].trail) { delete lean[k].trail; dropped++; }
+      }
+      json = JSON.stringify(lean);
+      if (json.length > OVERRIDES_LIMIT) {
+        /* Nothing left to shed. Better to stop and say so than to send a write
+           that will be rejected and leave the adviser thinking it saved. */
+        throw new Error("This month's work for " + adviser + " is too large to save (" +
+          json.length.toLocaleString("en-AU") + " of " + OVERRIDES_LIMIT.toLocaleString("en-AU") +
+          " characters). Nothing has been lost on screen. Tell an admin before closing the tab.");
+      }
+      toast("Note history for " + dropped + " client" + (dropped === 1 ? "" : "s") +
+        " was dropped to fit the month in. Fees and comments are unaffected.", "bad");
+    }
     const stamp = json + "|" + st.status + "|" + (st.note || "") + "|" + (st.submittedAt || "") + "|" + (st.approvedAt || "");
     if (sp.lastOverride[key][adviser] === stamp) continue;      // nothing changed for this adviser
     const fields = {
@@ -2037,12 +2070,14 @@ async function notifyRunOpened(run) {
     const what = n + " client" + (n === 1 ? "" : "s") + " to review for " + monthLabel(run.key);
     if (!has(a, "Review ready")) {
       rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Review ready", status: "Queued",
-        message: greeting(a) + what + ".\n\nThis is due within " + REMINDER_DAYS + " days." }));
+        message: greeting(a) + what + ".\n\nThis is due within " + REMINDER_DAYS + " days." +
+          "\n\n" + REVIEW_OFFER_LINE }));
     }
     if (!has(a, "Reminder")) {
       rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Reminder", status: "Scheduled", dueAt: due,
         cc: regionalManagersFor(a).map(m => m.email).join(";"),
-        message: greeting(a) + what + ", still outstanding after " + REMINDER_DAYS + " days." }));
+        message: greeting(a) + what + ", still outstanding after " + REMINDER_DAYS + " days." +
+          "\n\n" + REVIEW_OFFER_LINE }));
     }
   }
   const sent = await sendNotifications(rows);
@@ -2149,7 +2184,8 @@ async function notifyReminder(run, adviser) {
     message: greeting(adviser) + (st === "Returned"
       ? "Your " + monthLabel(run.key) + " review has been sent back and needs another look."
       : n + " client" + (n === 1 ? "" : "s") + " still to review for " + monthLabel(run.key) + ".") +
-      "\n\nPlease complete as soon as possible."
+      "\n\nPlease complete as soon as possible." +
+      (st === "Returned" ? "" : "\n\n" + REVIEW_OFFER_LINE)
   })], { note: "Reminder queued for " + adviser + "." });
 }
 
@@ -2728,6 +2764,14 @@ function calculate(run) {
   const overrides = run.overrides || {};
   const advIndex = new Map(state.advisers.map(a => [a.name, a]));
   const catIndex = new Map(rc.categories.map(c => [String(c.name).toLowerCase(), c.annual]));
+  /* The top of each tier's band, so a fee can be checked against the tier it is
+     supposed to sit in. Null for the open-ended top tier. */
+  const bands = categoryBands(rc);
+  const catCeil = new Map(bands.map(b => [String(b.c.name).toLowerCase(), b.to]));
+  /* Distinct floors in order, for naming the tier a fee actually lands in.
+     Several names can share a floor; the first alphabetically stands for it. */
+  const tierOrder = [...new Map(bands.map(b => [b.from, { from: b.from, name: b.c.name }])).values()]
+    .sort((a, b) => a.from - b.from);
   const weightIndex = new Map(rc.entityWeights.map(w => [String(w.name).toLowerCase(), w.weight]));
   const funds = buildFundIndex(state.funds);
 
@@ -2889,6 +2933,18 @@ function calculate(run) {
       m.rateCardFee = Math.max(base + m.entityFee + m.surcharge, m.currentFee, rc.absoluteMinimum);
     }
 
+    /* A client whose rate card fee climbs past the top of their own tier has
+       usually outgrown it — entities and FUM have carried them into the band
+       above. Says nothing about whether the fee is right; says the tier is
+       probably stale. The top tier is open-ended, so it can never trip. */
+    m.tierCeiling = catCeil.has(String(lookup).toLowerCase())
+      ? catCeil.get(String(lookup).toLowerCase()) : null;
+    m.aboveTier = m.rateCardFee != null && m.tierCeiling != null && m.rateCardFee > m.tierCeiling;
+    m.aboveTierBy = m.aboveTier ? m.rateCardFee - m.tierCeiling : null;
+    /* Which tier they would land in on the fee they have now. */
+    m.tierByFee = m.rateCardFee == null ? null
+      : (tierOrder.filter(t => m.rateCardFee >= t.from).pop() || {}).name || null;
+
     const ov = overrides["master:" + m.masterId] || {};
     m.pctInput = ov.pctInput != null ? num(ov.pctInput) : null;                 // AB, when typed over
     m.comment = ov.comment || "";                                               // AM
@@ -2905,8 +2961,10 @@ function calculate(run) {
     /* Who left what. Anyone with a run open can edit a comment now, so the note
        and its author are no longer the same person by definition. */
     m.trail = ov.trail || [];
+    /* The newest comment entry is by whoever last touched the box, so it is the
+       author of what is in it now — no text comparison needed. */
     const lastNote = [...m.trail].reverse().find(t => t.kind === "comment");
-    m.commentBy = (m.comment && lastNote && lastNote.text === m.comment) ? lastNote.by : "";
+    m.commentBy = (m.comment && lastNote) ? lastNote.by : "";
     const lastGone = [...m.trail].reverse().find(t => t.kind === "removed");
     m.removedBy = lastGone ? lastGone.by : "";
     m.removedAt = lastGone ? lastGone.at : "";
@@ -3334,11 +3392,27 @@ function trailWith(masterId, kind, text) {
   const cur = run.overrides["master:" + masterId] || {};
   const trail = (cur.trail || []).slice();
   const last = trail[trail.length - 1];
-  if (last && last.kind === kind && last.text === (text || "")) return null;
-  trail.push({ at: new Date().toISOString(), by: noteAuthor(), kind, text: text || "" });
-  /* Bounded. A comment edited twenty times is not twenty pieces of history, and
-     the whole run's overrides have to fit in one SharePoint column. */
-  return trail.slice(-12);
+  const now = new Date().toISOString();
+
+  /* A comment records who and when, not what. The comment that is *current* is
+     already stored in full beside it, and superseded text is the one part of
+     this worth paying for least — every adviser's whole book shares a single
+     63,999 character column, and storing each draft trebled the cost of it.
+     Removals keep their reason: there are few of them and the reason is the
+     entire point. */
+  if (kind === "comment") {
+    /* Somebody editing their own comment is one event, not six. Re-stamp the
+       time rather than appending again. */
+    if (last && last.kind === "comment" && last.by === noteAuthor()) {
+      trail[trail.length - 1] = { ...last, at: now };
+      return trail;
+    }
+    trail.push({ at: now, by: noteAuthor(), kind });
+  } else {
+    if (last && last.kind === kind && last.text === String(text || "").slice(0, 140)) return null;
+    trail.push({ at: now, by: noteAuthor(), kind, text: String(text || "").slice(0, 140) });
+  }
+  return trail.slice(-6);
 }
 
 const TRAIL_VERB = { comment: "commented", removed: "removed from the review", restored: "put back in the review" };
@@ -4075,7 +4149,13 @@ function clientTable(list, locked) {
             " cannot come off the platform (" + r.limitedBy + ")").join(" · ")) + '">' +
           (m.houseSplitApplies ? "FUM under the minimum &mdash; " : "needs direct debit &mdash; ") +
           money(m.splitFunds.reduce((a, r) => a + r.shortfall, 0)) + " by direct debit</span>" : "") +
-      (m.mode === "Variable" && m.unsetFunds ? ' <span class="pill warn">' + m.unsetFunds + " fund" + (m.unsetFunds > 1 ? "s" : "") + " unset</span>" : "");
+      (m.mode === "Variable" && m.unsetFunds ? ' <span class="pill warn">' + m.unsetFunds + " fund" + (m.unsetFunds > 1 ? "s" : "") + " unset</span>" : "") +
+      (m.aboveTier ? ' <span class="pill warn" title="' +
+          esc("The rate card fee is " + money(m.aboveTierBy) + " above the top of " + (m.mappedTo || m.category) +
+            " (" + money(m.tierCeiling) + ")" +
+            (m.tierByFee ? ". On this fee they sit in " + m.tierByFee + "." : "") +
+            " Check the category in Xplan.") + '">above tier' +
+          (m.tierByFee ? " &mdash; " + esc(m.tierByFee) : "") + "</span>" : "");
     html += "<tr>" +
       '<td><button class="expand" data-exp="' + esc(m.masterId) + '">' + (open ? "&minus;" : "+") + "</button></td>" +
       /* Three lines, in the order somebody scans them: who, which record, how
@@ -4406,6 +4486,7 @@ function viewExceptions() {
   const totalUnpriced = c.unpricedCats.reduce((a, x) => a + x[1], 0);
   const off = c.masters.filter(m => m.outsideBand);
   const below = c.masters.filter(m => m.belowCurrent);
+  const aboveTier = c.masters.filter(m => m.aboveTier);
   const unsetTotal = c.unsetFundClients.reduce((a, m) => a + m.unsetFunds, 0);
 
   const capRows = [];
@@ -4454,6 +4535,27 @@ function viewExceptions() {
           "month's totals as well as their new one, so a month with removals will not reconcile against the raw extract. " +
           "That is the intent &mdash; but it is why the reason matters.</div>"
         : none("No client has been taken out of this review.") },
+
+    { key: "abovetier", tone: "warn", count: aboveTier.length, note: "clients",
+      tile: "Above their tier", title: "Rate card fee above the client's own tier",
+      sub: "Entities and FUM have carried these clients past the top of the tier they are in. The fee is not wrong — the category probably is.",
+      body: () => aboveTier.length
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Tier</th>' +
+          '<th class="num">Top of tier</th><th class="num">Rate card</th><th class="num">Over by</th>' +
+          '<th>Lands in</th></tr></thead><tbody>' +
+          aboveTier.map(m => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
+            "<td>" + esc(m.adviser) + "</td>" +
+            "<td>" + esc(m.mappedTo || m.category || "—") +
+              (m.mappedTo ? '<div class="small muted">mapped from ' + esc(m.category) + "</div>" : "") + "</td>" +
+            '<td class="num">' + money(m.tierCeiling) + '</td><td class="num">' + money(m.rateCardFee) +
+            '</td><td class="num">' + money(m.aboveTierBy) + "</td>" +
+            "<td>" + (m.tierByFee ? "<strong>" + esc(m.tierByFee) + "</strong>" : '<span class="muted">—</span>') +
+            "</td></tr>").join("") + "</tbody></table>" +
+          '<div class="spacer"></div><div class="small muted">Nothing here is blocked and no fee is changed. ' +
+          "A client outgrowing their tier is normal &mdash; the fix is the category in Xplan, not the fee. Legacy and " +
+          "inherited categories will drift into the right tier over time, so treat this as a list to work through " +
+          "rather than a fault.</div>"
+        : none("No client's rate card fee sits above the tier they are in.") },
 
     { key: "ambiguous", tone: "warn", count: c.ambiguous.length, note: "codes",
       tile: "Codes to confirm", title: "Category codes worth confirming",
@@ -4701,11 +4803,14 @@ function attentionFor(ms, removed) {
   const platform = ms.filter(m => m.overCap || m.underMinBalance.length).length;
   const below = ms.filter(m => m.belowCurrent).length;
   const gone = (removed || []).length;
+  const tier = ms.filter(m => m.aboveTier).length;
   if (gone) parts.push({ label: gone + " removed", cls: "bad" });
+  /* Singular reads badly in an email, and this line goes in one. */
+  if (tier) parts.push({ label: tier + (tier === 1 ? " requires a tier upgrade" : " require tier upgrades"), cls: "warn" });
   if (band) parts.push({ label: band + " off band", cls: "warn" });
   if (platform) parts.push({ label: platform + " platform issue" + (platform > 1 ? "s" : ""), cls: "bad" });
   if (below) parts.push({ label: below + " below current", cls: "bad" });
-  return { parts, total: gone + band + platform + below };
+  return { parts, total: gone + tier + band + platform + below };
 }
 
 /* The adviser's book, inline. Read-only on purpose: this screen is for deciding
@@ -5267,24 +5372,48 @@ function settingsTiles(sections) {
 function reviewSections(ro) {
   const rc = state.rateCard, c = state.calc;
   const unpriced = rc.categories.filter(x => !(num(x.annual) > 0)).length;
+  const bandCount = new Set(rc.categories.map(x => num(x.annual))).size;
   const capless = state.funds.filter(f => f.active !== false && !(f.capPct > 0) && !(f.capAmount > 0)).length;
   const fundTrouble = c ? (c.unknownFunds.length + c.noPlatform.length + c.fundClashes.length) : 0;
   const noRate = c ? c.categories.filter(e => e.rate == null).length : 0;
 
   return [
     { key: "cats", title: "Category rates",
-      meta: rc.categories.length + (rc.categories.length === 1 ? " tier" : " tiers"),
+      meta: rc.categories.length + (rc.categories.length === 1 ? " tier" : " tiers") +
+        (bandCount && bandCount !== rc.categories.length ? " · " + bandCount + " bands" : ""),
       warn: !rc.categories.length ? "none set"
-          : unpriced ? unpriced + " with no fee" : "",
+          : unpriced ? unpriced + " with no lower limit" : "",
       actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddCat">Add category</button></div>',
-      body: () =>
-        '<table><thead><tr><th>Category</th><th class="num">Annual fee</th><th class="no-print"></th></tr></thead><tbody>' +
-        rc.categories.map((x, i) =>
-          '<tr><td><input type="text" class="grow-x" data-rc="cat" data-i="' + i + '" data-f="name" value="' + esc(x.name) + '"' + ro + "></td>" +
-          '<td class="num"><input type="number" class="w110 num" data-rc="cat" data-i="' + i + '" data-f="annual" value="' + x.annual + '"' + ro + "></td>" +
-          (ro ? "<td></td>" : '<td class="no-print"><button class="btn ghost icon-x" data-delcat="' + i +
-            '" title="Remove ' + esc(x.name) + '" aria-label="Remove ' + esc(x.name) + '">&times;</button></td>') + "</tr>").join("") +
-        "</tbody></table>" },
+      body: () => {
+        const bands = categoryBands(rc);
+        return '<div class="tbl-scroll"><table><thead><tr><th>Category</th>' +
+          '<th class="num">From</th><th class="num">To</th><th>Covers</th>' +
+          (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+          bands.map(b =>
+            '<tr><td><input type="text" class="grow-x" data-rc="cat" data-i="' + b.i + '" data-f="name" value="' +
+              esc(b.c.name) + '"' + ro + "></td>" +
+            '<td class="num"><input type="number" class="w110 num" data-rc="cat" data-i="' + b.i +
+              '" data-f="annual" value="' + b.c.annual + '"' + ro + "></td>" +
+            /* Derived, so it is shown rather than typed — two typed limits can
+               disagree and leave a client in the gap between two tiers. */
+            '<td class="num mono">' + (b.to == null ? "&mdash;" : money(b.to)) + "</td>" +
+            '<td class="small muted">' + esc(bandLabel(b)) +
+              (b.sharedWith ? "<div>shares this band with " + b.sharedWith + " other" +
+                (b.sharedWith > 1 ? "s" : "") + "</div>" : "") + "</td>" +
+            (ro ? "" : '<td class="no-print"><button class="btn ghost icon-x" data-delcat="' + b.i +
+              '" title="Remove ' + esc(b.c.name) + '" aria-label="Remove ' + esc(b.c.name) + '">&times;</button></td>') +
+            "</tr>").join("") +
+          "</tbody></table></div>" +
+          '<div class="spacer"></div><div class="small muted"><strong>Only the lower limit is typed.</strong> ' +
+          "The upper one is whatever sits just below the next tier, so the tiers always meet and no client can fall " +
+          "between two of them. Move a tier's lower limit and the one beneath it grows or shrinks to match." +
+          "<br><br>Tiers sharing a lower limit share a band &mdash; <code>A</code>, <code>B</code> and " +
+          "<code>Private Wealth</code> at 22,000 are three names for the same tier. That is what the " +
+          "<strong>Category mapping</strong> section is for if you would rather keep one row per tier and point the " +
+          "Xplan codes at it." +
+          "<br><br>The lower limit is also the <strong>base fee</strong> for that tier: it is what a client in it starts " +
+          "at before entities and the FUM surcharge are added.</div>";
+      } },
 
     { key: "entities", title: "Additional entities",
       sub: "What a client group costs beyond its master client",
@@ -5619,6 +5748,32 @@ function pricingSections(ro) {
 /* "Marginal" is a word people nod at and then get wrong, so show it happening on
    a real number rather than explaining it twice. Built from whatever bands are
    currently set, so it stays true as they are edited. */
+/* Category tiers in band order, each with the upper limit worked out from the
+   next tier's lower one. Only the lower limit is ever typed: a pair of typed
+   limits can leave a gap between two tiers — or overlap them — and a client
+   landing in that gap has no tier at all. The top tier is open-ended.
+
+   Returns the original index alongside, because the editing table writes back
+   by position in `rc.categories` and this list is sorted. */
+function categoryBands(rc) {
+  const rows = (rc.categories || []).map((c, i) => ({ c, i, from: num(c.annual) }));
+  /* Several tiers share a floor — A, B and Private Wealth all start at 22,000 —
+     so the ceiling comes from the next *distinct* floor. Taking it from the next
+     row would give the first of any duplicate pair a band ending below where it
+     starts. */
+  const floors = [...new Set(rows.map(r => r.from))].sort((a, b) => a - b);
+  const ceilOf = f => {
+    const n = floors.indexOf(f);
+    return n + 1 < floors.length ? floors[n + 1] - 1 : null;
+  };
+  return rows
+    .sort((a, b) => a.from - b.from || String(a.c.name).localeCompare(String(b.c.name)))
+    .map(x => ({ ...x, to: ceilOf(x.from), sharedWith: rows.filter(r => r.from === x.from).length - 1 }));
+}
+
+const bandLabel = b => b.to == null ? money(b.from) + " and above"
+                     : money(b.from) + " – " + money(b.to);
+
 function surchargeWorkedExample(rc) {
   const bands = [...(rc.surchargeBands || [])]
     .map(b => ({ from: num(b.from), rate: num(b.rate) }))
