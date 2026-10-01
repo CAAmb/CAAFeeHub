@@ -605,7 +605,7 @@ td input.num{text-align:right}
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
-      <div class="who"><span class="avatar" id="whoAvatar">?</span><span class="who-name" id="whoName">Local mode</span></div>
+      <div class="who"><span class="avatar" id="whoAvatar">?</span><span class="who-name" id="whoName">Signing in…</span></div>
       <div class="small who-role" id="whoRole">Ops / Admin</div>
     </div>
     <button id="navToggle" class="nav-toggle" type="button" aria-label="Collapse menu">&laquo;</button>
@@ -643,8 +643,9 @@ td input.num{text-align:right}
    ========================================================================= */
 
 /* ---------------- configuration ----------------
-   Fill these in once IT has registered the Entra app and provisioned the
-   lists described in SETUP.md. Until then the app runs in local mode. */
+   The Entra app and the SharePoint lists behind these are described in
+   SETUP.md. Without a client ID the platform cannot sign anybody in and says so
+   rather than starting. */
 const CONFIG = {
   /* "CAA Fee Calculator Platform", registered 6 Sep 2026. */
   clientId: "366f7021-eae7-4f1b-b5cc-dfa133a57348",
@@ -653,14 +654,6 @@ const CONFIG = {
 };
 const SCOPES = ["Sites.ReadWrite.All", "User.Read"];
 
-/* Set true to work without signing in: the role switcher comes back, identity
-   is whatever you click, and everything stays in this browser. For developing
-   against a file with no Entra app behind it. Never true in anything anyone
-   else opens — a warning bar says so on every screen while it is on. */
-let FORCE_LOCAL_MODE = false;
-
-/* No client ID means no sign-in is possible, so there is nobody to be. */
-const localMode = () => FORCE_LOCAL_MODE || !connected();
 /* All prefixed "Fee Calculator" so they group together in Site Contents and it
    stays obvious which app owns them as more are added to this site. These are
    DISPLAY names — resolveSiteAndLists() maps them to ids once at startup, so
@@ -763,6 +756,12 @@ const EXPECTED_SCHEMA = {
     { name: "Aliases",    type: "note" },
     { name: "CapPercent", type: "number" },
     { name: "CapAmount",  type: "number" },
+    /* Both are written by fundToFields() and were missing from this audit, so
+       Check lists reported all-clear on a site without them — and a missing
+       CapInclGst silently shifts every cap comparison by the GST rate, while a
+       missing MinBalance stops the under-minimum warning ever firing. */
+    { name: "CapInclGst", type: "boolean" },
+    { name: "MinBalance", type: "number" },
     { name: "IsActive",   type: "boolean" },
     { name: "Notes",      type: "note" }
   ]},
@@ -893,57 +892,6 @@ const EMPTY_ADVISERS = [];
    the fund, and it is what recovers a platform when Xplan reports vendor N/A. */
 const EMPTY_FUNDS = [];
 
-/* Fictional, installed only alongside the sample run. Real caps live in the
-   SharePoint list. */
-const SAMPLE_FUNDS = [
-  { name: "CFS FirstChoice", aliases: ["CFS", "FirstChoice"], capPct: 2.2,     capAmount: 0,     minBalance: 0,     capInclGst: true },
-  { name: "AMP North",       aliases: ["North", "MyNorth"],   capPct: 2.2,     capAmount: 0,     minBalance: 20000, capInclGst: true },
-  { name: "IOOF Group",      aliases: ["IOOF", "Expand"],     capPct: 2.2,     capAmount: 18000, minBalance: 0,     capInclGst: true },
-  { name: "OnePath",         aliases: ["OnePath"],            capPct: 0,      capAmount: 0,     minBalance: 2000,  capInclGst: true },
-  { name: "HUB24",           aliases: ["HUB24", "HUB 24"],    capPct: 4.4,     capAmount: 11000, minBalance: 0,     capInclGst: true },
-  { name: "Netwealth",       aliases: ["Netwealth"],          capPct: 0,      capAmount: 0,     minBalance: 10000, capInclGst: true },
-  { name: "Panorama",        aliases: ["Panorama", "BT"],     capPct: 0,      capAmount: 0,     minBalance: 2000,  capInclGst: true },
-  { name: "Macquarie WRAP",  aliases: ["Macquarie"],          capPct: 1.75,   capAmount: 17500, minBalance: 10000, capInclGst: false },
-  /* No cap, but they still have to be here: the aliases are what recover a
-     platform when Xplan reports the vendor as N/A, and an account whose
-     platform is not recognised drops out of FUM entirely. */
-  { name: "Generation Life", aliases: ["Generation Life"],    capPct: 0,      capAmount: 0,     minBalance: 0,     capInclGst: true },
-  { name: "Challenger",      aliases: ["Challenger"],         capPct: 0,      capAmount: 0,     minBalance: 0,     capInclGst: true },
-  { name: "Futurity",        aliases: ["Futurity"],           capPct: 2.1,     capAmount: 0,     minBalance: 0,     capInclGst: true }
-].map(f => ({ ...f, active: true, notes: "" }));
-
-/* Fictional. Installed only alongside the sample run, and only when no rate card
-   has been configured yet, so the platform can be demonstrated end to end
-   without real pricing or real staff names being shipped in the file. */
-const SAMPLE_RATE_CARD = {
-  version: "Sample pricing",
-  effectiveFrom: "2026-07-01",
-  isSample: true,
-  categories: [
-    { name: "Essential", annual: 5000 },
-    { name: "Premium",   annual: 9000 },
-    { name: "Platinum",  annual: 15000 }
-  ],
-  aliases: {},
-  legacyRates: { "Essential": 4500, "Premium": 8000, "Platinum": 13000, "A": 20000, "B": 15000, "C": 9000 },
-  additionalEntityFee: 1000,
-  absoluteMinimum: 3000,
-  /* Fictional, like every other figure here. Coastal's real one lives in the
-     SharePoint rate card, not in this file. */
-  maxDrawPct: 2.0,
-  variancePct: 0.10,
-  entityWeights: [
-    { name: "Family",         weight: 1 },
-    { name: "SMSF",           weight: 2 },
-    { name: "Client Company", weight: 1 }
-  ],
-  surchargeBands: [
-    { from: 0,       rate: 0 },
-    { from: 300000,  rate: 0.008 },
-    { from: 1000000, rate: 0.007 },
-    { from: 3000000, rate: 0.005 }
-  ]
-};
 
 /* Who can use the app, and as what. Held in the SharePoint directory rather than
    in Entra groups: reading group membership needs another admin-consented
@@ -967,13 +915,6 @@ const CAN = {
 };
 const can = what => !!(CAN[state.role] || {})[what];
 
-/* Fictional advisers, matching the names sampleRows() generates. */
-const SAMPLE_ADVISERS = [
-  ["Aldridge, Petra",  "Northern"], ["Brannigan, Cole", "Northern"],
-  ["Castellan, Ruth",  "Northern"], ["Deverell, Marcus", "Southern"],
-  ["Enfield, Georgia", "Southern"]
-].map(([name, region]) => ({ name, region, email: "", active: true, role: "Adviser" }));
-
 /* The 12 columns the Xplan "CAA Fee Calculator Data" report emits, in order.
    Matching is by header text so a re-ordered export still lands correctly;
    position is only the fallback. */
@@ -993,126 +934,12 @@ const SOURCE_COLUMNS = [
 ];
 
 /* =========================================================================
-   Sample data
-   Fictional clients in the exact shape Xplan emits, so the platform can be
-   demonstrated without a real extract going anywhere near it. Deterministic —
-   everyone who loads the sample sees identical numbers, which matters when a
-   room is looking at the same screen.
-   ========================================================================= */
-const SAMPLE_LABEL = "Sample data";
-/* Bumped whenever sampleRows() or SAMPLE_ADVISERS changes, so a sample run
-   stored by an older build is rebuilt rather than left referring to advisers
-   that no longer exist. Only ever regenerates sample runs; real imports and the
-   work done on them are never touched. */
-const SAMPLE_VERSION = 2;
-
-/* Only ever fills a gap. Anyone who has configured real pricing keeps it — the
-   sample run then simply shows most of its clients unpriced, which is the
-   correct answer rather than a helpful-looking wrong one. */
-function installSampleReference() {
-  if (!state.rateCard.categories.length) {
-    state.rateCard = JSON.parse(JSON.stringify(SAMPLE_RATE_CARD));
-    saveRateCard();
-  }
-  if (!state.advisers.length) {
-    state.advisers = JSON.parse(JSON.stringify(SAMPLE_ADVISERS));
-    saveAdvisers();
-  }
-  if (!state.funds.length) {
-    state.funds = JSON.parse(JSON.stringify(SAMPLE_FUNDS)).map(normaliseFund);
-    saveFunds();
-  }
-}
-
-function sampleRows() {
-  let seed = 20260901;
-  const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
-  const pick = a => a[Math.floor(rnd() * a.length)];
-  const between = (lo, hi) => lo + rnd() * (hi - lo);
-
-  const SURNAMES = ["Ashford", "Bellamy", "Crane", "Dunmore", "Ellery", "Fairlie", "Gough", "Harlow",
-    "Ingram", "Jarratt", "Kellow", "Lonsdale", "Merrick", "Norwood", "Oakley", "Pemberton",
-    "Quillan", "Rathbone", "Standish", "Thackeray", "Underhill", "Vane", "Westbrook", "Yardley"];
-  const FIRSTS = ["Alan", "Bridget", "Callum", "Delia", "Eamon", "Frances", "Gordon", "Helena",
-    "Ivan", "Jenna", "Keith", "Lorna", "Marcus", "Nadia", "Owen", "Petra", "Roland", "Sylvia"];
-  /* Fictional, and matching SAMPLE_ADVISERS — except Fairweather, Ivy, who is
-     deliberately absent from it so the "adviser not in the directory" exception
-     has something to catch. */
-  const ADVISERS = ["Aldridge, Petra", "Brannigan, Cole", "Castellan, Ruth",
-                    "Deverell, Marcus", "Enfield, Georgia", "Fairweather, Ivy"];
-  const VENDORS = ["CFS FirstChoice", "AMP North", "IOOF Group", "OnePath", "HUB24", "Netwealth", "Panorama", "Macquarie WRAP"];
-  /* Weighted so the mix mirrors the real book: mostly Essential and the legacy
-     letter codes, which is what makes the mapping screen worth showing. */
-  const CATEGORIES = ["Essential", "Essential", "Essential", "Essential", "Essential", "Essential", "Essential",
-    "F", "F", "F", "F", "F", "E", "E", "E", "Premium", "Premium", "Basic", "Basic",
-    "Platinum", "Platinum", "C", "C", "Exclusive", "SMSF"];
-  const BASE_FEE = { Essential: 5200, Platinum: 10400, C: 12800, Exclusive: 19500, Premium: 7900,
-    Basic: 2400, F: 3500, E: 4700, SMSF: 4200 };
-
-  const rows = [];
-  let masterNo = 5100000;
-  let groupNo = 7600000;
-
-  for (let i = 0; i < CATEGORIES.length; i++) {
-    const category = CATEGORIES[i];
-    const adviser = pick(ADVISERS);
-    const surname = SURNAMES[i % SURNAMES.length];
-    const masterId = String(masterNo += Math.floor(between(700, 9000)));
-    const masterName = surname + ", " + pick(FIRSTS);
-    /* Roughly one client in five sits in a family group, which is the branch
-       that changes how total FUM is aggregated. */
-    const grouped = rnd() < 0.2;
-    const groupId = grouped ? String(groupNo += 431) : "N/A";
-    const currentFee = Math.round(BASE_FEE[category] * between(0.85, 1.15) / 10) * 10;
-
-    const members = [{ id: masterId, name: masterName, entityCat: category }];
-    if (rnd() < 0.45) members.push({ id: String(+masterId + 3), name: surname + ", " + pick(FIRSTS), entityCat: category });
-    if (rnd() < 0.3)  members.push({ id: String(+masterId + 7), name: surname + " Family Trust", entityCat: "Family" });
-    if (rnd() < 0.2)  members.push({ id: String(+masterId + 9), name: surname + " Superannuation Fund", entityCat: "SMSF" });
-    if (rnd() < 0.12) members.push({ id: String(+masterId + 11), name: surname + " Holdings Pty Ltd", entityCat: "Client Company" });
-
-    for (const mem of members) {
-      /* Every member carries a "Default" line with no value and no vendor —
-         the noise the old process filtered out by hand every month. */
-      rows.push({ groupId, masterId, masterName, memberId: mem.id, memberName: mem.name,
-        adviser, category, entityCat: mem.entityCat, subfundName: "Default", vendor: "N/A",
-        value: 0, currentFee });
-
-      const accounts = 1 + Math.floor(rnd() * 3);
-      for (let a = 0; a < accounts; a++) {
-        const vendor = VENDORS[Math.floor(rnd() * VENDORS.length)];
-        const kind = pick(["Super", "Pension", "Investment", "Super Account", "Wrap"]);
-        rows.push({ groupId, masterId, masterName, memberId: mem.id, memberName: mem.name,
-          adviser, category, entityCat: mem.entityCat,
-          subfundName: vendor + " " + kind + " - " + Math.floor(between(100000000, 999999999)) + " - " + mem.name.split(",")[0],
-          vendor, value: Math.round(between(38000, 1250000)), currentFee });
-      }
-      /* A handful of accounts arrive with the platform only in the description,
-         which is what the platform-name recovery exists to catch. */
-      if (rnd() < 0.25) {
-        rows.push({ groupId, masterId, masterName, memberId: mem.id, memberName: mem.name,
-          adviser, category, entityCat: mem.entityCat,
-          subfundName: pick(["MyNorth", "Expand", "Generation Life", "Challenger"]) + " Investment - " + mem.name.split(",")[0],
-          vendor: "N/A", value: Math.round(between(25000, 480000)), currentFee });
-      }
-    }
-  }
-  return rows;
-}
-
-
-/* =========================================================================
    State + persistence
    Phase 1 persists to localStorage. store.* is the seam the SharePoint layer
    drops into: same four reads, same four writes.
    ========================================================================= */
-const LS = {
-  rateCard: "caaFee.rateCard",
-  advisers: "caaFee.advisers",
-  funds:    "caaFee.funds",
-  runs:     "caaFee.runs",
-  ui:       "caaFee.ui"
-};
+/* The only thing kept on the machine. Everything else comes from the site. */
+const LS = { ui: "caaFee.ui" };
 
 const store = {
   read(key, fallback) {
@@ -1142,10 +969,9 @@ const state = {
      balance and no platform. They are noise on a review screen, so they are
      hidden unless somebody deliberately asks to see them. */
   showEmptyDefaults: false,
-  /* One of ROLES. In local mode the switch in the top bar sets it so every tier
-     can be demonstrated; once signed in it comes from the directory and is not
-     selectable. Defaults to Admin because local mode is where you set things up. */
-  role: "Admin",
+  /* One of ROLES, resolved from the directory at sign-in and never chosen.
+     Empty until then, so an unresolved session can do nothing. */
+  role: "",
   /* Who the adviser view is standing in as. In production this is resolved from
      the signed-in account against the Adviser Directory and is not selectable;
      here it is a picker so the whole flow can be demonstrated. */
@@ -1157,8 +983,8 @@ const state = {
   exOpen: {},
   navCollapsed: null,     // null = follow the viewport, true/false = pinned by the user
   theme: "system",        // "system" | "light" | "dark"
-  /* Set once by resolveIdentity(). Null in local mode, and null while a
-     connected app is still working out who is at the keyboard. */
+  /* Set once by resolveIdentity(). Null while the app is still working out who
+     is at the keyboard. */
   identity: null,
   authState: "",          // "" | "signing-in" | "ready" | "denied" | "error"
   authError: "",
@@ -1184,59 +1010,23 @@ function hydrateCard(raw) {
       claims:  { ...seed.pricing.claims,  ...(p.claims  || {}) } } };
 }
 
-function loadAll() {
-  const stored = store.read(LS.rateCard, null);
-  state.rateCard = hydrateCard(stored);
-  state.advisers = store.read(LS.advisers, null) || JSON.parse(JSON.stringify(EMPTY_ADVISERS));
-  state.funds = (store.read(LS.funds, null) || JSON.parse(JSON.stringify(EMPTY_FUNDS))).map(normaliseFund);
+/* Everything the app works on comes from the site at sign-in. The only thing
+   this browser keeps is how the person likes it arranged — theme, sidebar, which
+   month they were on — which is per-machine by nature and not worth a round trip.
 
-  /* Platform names used to be a plain list on the rate card, used only to
-     recover a vendor Xplan reported as N/A. They are funds now. Carry them over
-     with no caps set rather than making anyone retype them — a fund with no cap
-     still does the matching it always did. */
-  if (!state.funds.length && stored && Array.isArray(stored.platforms) && stored.platforms.length) {
-    state.funds = stored.platforms.map(p => normaliseFund({ name: p }));
-    saveFunds();
-  }
+   No pricing, no adviser, no client, no run. Close the tab and the data is gone;
+   what comes back is a layout preference. */
+function loadUiPrefs() {
+  state.rateCard = hydrateCard(null);
+  state.advisers = [];
+  state.funds = [];
+  state.runs = {};
 
-  state.runs = store.read(LS.runs, {}) || {};
   const ui = store.read(LS.ui, {}) || {};
-  state.runKey = ui.runKey && state.runs[ui.runKey] ? ui.runKey : (Object.keys(state.runs).sort().pop() || null);
-  /* Only local mode remembers a role, because only local mode lets you choose
-     one. Connected, it is a fact about the directory and is resolved at sign-in
-     — starting from empty means an unresolved session can do nothing rather
-     than briefly being whatever this browser was last time. */
-  state.role = localMode() ? (ROLES.includes(ui.role) ? ui.role : "Admin") : "";
-  state.asAdviser = localMode() ? (ui.asAdviser || null) : null;
+  state.runKey = ui.runKey || null;      // confirmed against the index once it loads
   state.navCollapsed = ui.navCollapsed === undefined ? null : ui.navCollapsed;
   state.theme = ui.theme || "system";
   state.showEmptyDefaults = !!ui.showEmptyDefaults;
-  migrateRuns();
-}
-
-/* Payment source used to be settable on the client line, which meant one pick
-   covered every fund. That control is gone — sources live on the funds now — so
-   push any client-level source that was already chosen down onto its own funds.
-   Without this a run reviewed under the old build would silently lose the
-   payment side of its work. Runs at rest, so it only ever runs once each. */
-function migrateRuns() {
-  let touched = false;
-  for (const key of Object.keys(state.runs)) {
-    const run = state.runs[key];
-    if (!run || run.fundPayMigrated || !run.rows) continue;
-    run.overrides = run.overrides || {};
-    run.rows.forEach((r, i) => {
-      const mov = run.overrides["master:" + r.masterId];
-      const src = mov && mov.paymentSource;
-      if (src !== "Direct Debit" && src !== "Platform") return;
-      const rk = "row:" + rowKey(r, i);
-      const rov = run.overrides[rk] || {};
-      if (!rov.paymentSource) { rov.paymentSource = src; run.overrides[rk] = rov; }
-    });
-    run.fundPayMigrated = true;
-    touched = true;
-  }
-  if (touched) saveRuns();
 }
 
 /* "system" deliberately stamps nothing, leaving prefers-color-scheme to decide;
@@ -1366,17 +1156,16 @@ function matchFundDetail(r, index) {
 }
 
 
-/* Local mode writes to this browser; connected, the same call queues a write to
-   SharePoint. Every caller in the app is unchanged either way — this is the
-   seam the whole thing was built around. */
-const saveRateCard = () => localMode() ? store.write(LS.rateCard, state.rateCard) : queueSave("rateCard");
-const saveAdvisers = () => localMode() ? store.write(LS.advisers, state.advisers) : queueSave("advisers");
-const saveFunds = () => localMode() ? store.write(LS.funds, state.funds) : queueSave("funds");
-const saveRuns = () => localMode() ? store.write(LS.runs, state.runs) : queueSave("runs");
+/* Everything goes to the site, debounced through one queue. */
+const saveRateCard = () => queueSave("rateCard");
+const saveAdvisers = () => queueSave("advisers");
+const saveFunds    = () => queueSave("funds");
+const saveRuns     = () => queueSave("runs");
+/* The exception, and the only thing this browser stores: how the person likes
+   the app arranged. No role — that is resolved from the directory at sign-in. */
 const saveUi = () => store.write(LS.ui, {
-  runKey: state.runKey, role: state.role, asAdviser: state.asAdviser,
-  navCollapsed: state.navCollapsed, theme: state.theme,
-  showEmptyDefaults: state.showEmptyDefaults
+  runKey: state.runKey, navCollapsed: state.navCollapsed,
+  theme: state.theme, showEmptyDefaults: state.showEmptyDefaults
 });
 
 /* =========================================================================
@@ -1789,7 +1578,6 @@ async function loadRun(key) {
   if (!run || run.loaded) return;
   const data = await spGetFile(runFilePath(key));
   run.rows = (data && Array.isArray(data.rows)) ? data.rows : [];
-  run.isSample = false;
 
   const items = await spItems("overrides");
   run.overrides = {};
@@ -1823,7 +1611,6 @@ async function loadRun(key) {
 const saver = { pending: new Set(), timer: null, busy: false, failed: 0 };
 
 function queueSave(what) {
-  if (localMode()) return;
   saver.pending.add(what);
   state.saveState = "pending";
   paintSaveState();
@@ -1978,7 +1765,7 @@ async function writeRun() {
 const adviserRow = name => state.advisers.find(a => a.name === name) || null;
 const adviserEmail = name => { const a = adviserRow(name); return (a && a.email) || ""; };
 
-/* Xplan files people surname-first — "Aldridge, Petra" — so the given name is
+/* Xplan files people surname-first — "Surname, First" — so the given name is
    whatever follows the comma. A directory row typed the other way round still
    works: without a comma, take the first word. A middle name is dropped either
    way, since "Hi Petra Jane," is not how anybody writes to a colleague. */
@@ -2037,7 +1824,7 @@ async function existingNotifications(runKey) {
 }
 
 async function sendNotifications(rows, { note } = {}) {
-  if (localMode() || !rows.length) return 0;
+  if (!rows.length) return 0;
   if (!sp.lists.notifications) {
     toast("The " + LIST_TITLES.notifications + " list does not exist yet, so nothing was queued.", "bad");
     return 0;
@@ -2055,7 +1842,7 @@ async function sendNotifications(rows, { note } = {}) {
    chase at the same time. Advisers with no email address in the directory are
    named rather than skipped in silence. */
 async function notifyRunOpened(run) {
-  if (localMode() || !state.calc) return;
+  if (!state.calc) return;
   const advisers = [...new Set(state.calc.masters.map(m => m.adviser))].filter(Boolean).sort();
   const already = await existingNotifications(run.key);
   const has = (adviser, kind) => already.some(f => f.Adviser === adviser && f.Kind === kind);
@@ -2109,7 +1896,6 @@ function reportNotifyResult(res) {
    eye on it. The scheduled reminder is left alone — the daily flow checks the
    adviser's status when it comes due and cancels itself. */
 async function notifySubmitted(run, adviser) {
-  if (localMode()) return;
   const mgrs = regionalManagersFor(adviser);
   if (!mgrs.length) return;
   const chk = checkSummaryFor(adviser);
@@ -2145,7 +1931,6 @@ async function notifySubmitted(run, adviser) {
    manager's note is the whole point of the message, so it is carried verbatim
    rather than summarised. */
 async function notifyReturned(run, adviser, note) {
-  if (localMode()) return;
   const to = adviserEmail(adviser);
   if (!to) { toast(adviser + " has no email in the directory, so they were not told.", "bad"); return; }
   const clean = String(note || "").trim();
@@ -2160,7 +1945,6 @@ async function notifyReturned(run, adviser, note) {
 }
 
 async function notifyApproved(run, adviser) {
-  if (localMode()) return;
   const to = adviserEmail(adviser);
   if (!to) return;
   await sendNotifications([notifyRow({
@@ -2318,7 +2102,7 @@ function paintSaveState() {
 
 /* A dropped save must not leave silently. */
 addEventListener("beforeunload", e => {
-  if (localMode() || (!saver.pending.size && state.saveState !== "error")) return;
+  if (!saver.pending.size && state.saveState !== "error") return;
   e.preventDefault();
   e.returnValue = "";
 });
@@ -2576,21 +2360,40 @@ function celebrate() {
 /* Widens a text input to fit its own content. An input's scrollWidth does not
    reliably report the text width, so measure it with a hidden span carrying the
    same typography. One span, reused. */
-let _ruler = null;
-function fitInputWidth(el) {
-  if (!_ruler) {
-    _ruler = document.createElement("span");
-    _ruler.setAttribute("aria-hidden", "true");
-    _ruler.style.cssText = "position:absolute;left:-9999px;top:-9999px;white-space:pre;visibility:hidden";
-    document.body.appendChild(_ruler);
+/* Measured on a canvas rather than a hidden span. A span has to be written to
+   and then read back, and doing that once per input forces a layout each time:
+   sixty of them cost 74ms on every render, which is most of a review screen's
+   lag. Canvas text metrics need no layout at all.
+
+   Reads are also kept ahead of writes, so the browser lays out once rather than
+   once per element. */
+let _fitCtx = null;
+function fitInputWidths(els) {
+  if (!els.length) return;
+  if (!_fitCtx) _fitCtx = document.createElement("canvas").getContext("2d");
+  const want = [];
+  for (const el of els) {
+    const cs = getComputedStyle(el);
+    _fitCtx.font = cs.font || (cs.fontStyle + " " + cs.fontWeight + " " + cs.fontSize + " " + cs.fontFamily);
+    const text = el.value || el.placeholder || "";
+    const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) +
+                parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
+    /* Canvas ignores letter-spacing, so it is added back per character. */
+    const ls = parseFloat(cs.letterSpacing) || 0;
+    want.push([el, Math.max(110, Math.ceil(_fitCtx.measureText(text).width + ls * text.length + pad) + 6)]);
   }
-  const cs = getComputedStyle(el);
-  _ruler.style.font = cs.font;
-  _ruler.style.letterSpacing = cs.letterSpacing;
-  _ruler.textContent = el.value || el.placeholder || "";
-  const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) +
-              parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
-  el.style.width = Math.max(110, Math.ceil(_ruler.offsetWidth + pad) + 6) + "px";
+  for (const [el, w] of want) el.style.width = w + "px";
+}
+const fitInputWidth = el => fitInputWidths([el]);
+
+/* Same trick for the comment boxes: every height is cleared, then every
+   scrollHeight is read, then every height is set — two layouts for the screen
+   instead of two per box. */
+function fitTextareas(els) {
+  if (!els.length) return;
+  for (const el of els) el.style.height = "auto";
+  const want = els.map(el => Math.min(el.scrollHeight, 220));
+  els.forEach((el, i) => { el.style.height = want[i] + "px"; });
 }
 
 function toast(msg, kind) {
@@ -3322,8 +3125,6 @@ function setAddedFunds(masterId, list) {
 function newRun(monthKey, rows, sourceName) {
   return {
     key: monthKey,
-    isSample: sourceName === SAMPLE_LABEL,
-    sampleVersion: sourceName === SAMPLE_LABEL ? SAMPLE_VERSION : undefined,
     createdAt: new Date().toISOString(),
     sourceName: sourceName || "",
     status: "Draft",
@@ -3348,11 +3149,13 @@ function recalc() {
   state.calc = (run && Array.isArray(run.rows)) ? calculate(run) : null;
 }
 
-/* Local mode's leftovers are not this app's data once there is a real source
-   of truth, and a monthly extract has no business sitting in a browser profile
-   on a shared machine. The UI preferences stay — they are nobody's secret. */
-function clearLocalData() {
-  for (const k of [LS.rateCard, LS.advisers, LS.funds, LS.runs]) {
+/* Nothing writes these any more. A browser that used the platform before the
+   site became the source of truth may still be holding a month's extract in its
+   profile, so they are cleared once on the way in. Removable in a later version,
+   once every machine has been through here. */
+const LEGACY_KEYS = ["caaFee.rateCard", "caaFee.advisers", "caaFee.funds", "caaFee.runs"];
+function clearLegacyLocalData() {
+  for (const k of LEGACY_KEYS) {
     try { localStorage.removeItem(k); } catch (e) { /* a locked-down browser is fine */ }
   }
 }
@@ -3364,7 +3167,7 @@ async function openRun(key) {
   state.expanded = {};
   state.expandedAdviser = {};
   saveUi();
-  if (!localMode() && !state.runs[key].loaded) {
+  if (!state.runs[key].loaded) {
     toast("Loading " + monthLabel(key) + "…");
     try { await loadRun(key); }
     catch (e) { toast("Could not load " + monthLabel(key) + ". " + ((e && e.message) || e), "bad"); }
@@ -3372,14 +3175,11 @@ async function openRun(key) {
   render();
 }
 
-/* Who to record against a note. Connected, this is the signed-in person. In
-   local mode there is nobody to be, so it falls back to whoever the role
-   switcher is standing in as — which is honest about what local mode is. */
+/* Who to record against a note: the signed-in person. Nothing reaches a note
+   before the gate has resolved them, so the fallback is only ever a safety net. */
 function noteAuthor() {
   const id = state.identity;
-  if (id && id.name) return id.name;
-  if (can("ownBook") && state.asAdviser) return state.asAdviser;
-  return state.role || "Unknown";
+  return (id && id.name) || state.asAdviser || state.role || "Unknown";
 }
 
 /* Returns the trail a client would have after this entry, or null when the
@@ -3583,10 +3383,9 @@ async function startSession() {
        which is the name their clients are filed under. */
     state.asAdviser = id.role === "Adviser" && id.row ? String(id.row.Title || "") : null;
 
-    /* Anything this browser was holding from local mode is not this app's
-       data any more, and client records have no business sitting in a profile
-       once there is a real source of truth. */
-    clearLocalData();
+    /* Client records have no business sitting in a browser profile on a shared
+       machine once the site is the source of truth. */
+    clearLegacyLocalData();
 
     state.authState = "loading";
     renderGate();
@@ -3676,17 +3475,16 @@ function renderGate() {
 
 function render() {
   /* Connected and not yet through the gate: nothing of the app is drawn. */
-  if (!localMode() && state.authState !== "ready") { renderGate(); return; }
+  if (state.authState !== "ready") { renderGate(); return; }
   document.body.classList.remove("gate");
   recalc();
 
-  /* Nobody may be left standing on a screen their role cannot open, and an
-     adviser cannot be nobody — default them into the first adviser with clients. */
+  /* An adviser is whoever signed in and nobody else. This used to fall back to
+     the first adviser with clients, which was harmless while a picker existed to
+     stand in as anybody — and would now quietly open somebody else's book to an
+     adviser who simply has no clients this month. They see an empty book, which
+     is the true answer. */
   const adviserMode = can("ownBook");
-  if (adviserMode) {
-    const inRun = advisersInRun();
-    if (!state.asAdviser || (inRun.length && !inRun.includes(state.asAdviser))) state.asAdviser = inRun[0] || null;
-  }
   if (!visibleViews().some(v => v.id === state.view)) {
     state.view = (visibleViews()[0] || { id: "review" }).id;
   }
@@ -3720,7 +3518,7 @@ function render() {
     ? state.role + (adviserMode && dir ? " · " + dir.region : "")
     : adviserMode
       ? (dir ? dir.region + " region" : "not in the directory")
-      : "Local mode — no sign-in";
+      : "";
   $("#whoAvatar").textContent = initials(who);
   renderTopActions();
   paintSaveState();
@@ -3728,18 +3526,15 @@ function render() {
   const fn = { run: viewRun, review: viewReview, exceptions: viewExceptions,
                approvals: viewApprovals, pricing: viewPricing, ratecard: viewRateCard,
                people: viewPeople, settings: viewSettings }[state.view];
-  /* Says out loud, on every screen, that anybody can be anybody. Better a
-     banner nobody can miss than a constant nobody remembers. */
+  /* The one state where somebody holds more authority than the directory gave
+     them, said out loud on every screen until it is closed. */
   const bootstrapping = state.identity && state.identity.bootstrap;
-  $("#demoBar").innerHTML = localMode()
-    ? '<strong>Local mode.</strong> No sign-in, so the role buttons in the top bar decide who you are and anyone ' +
-      "can read any adviser's book. Everything stays in this browser. Not for real client data."
-    : bootstrapping
-      ? '<strong>No Admin in the directory yet.</strong> Until a row in <code>' + esc(LIST_TITLES.advisers) +
-        "</code> has <code>AccessRole</code> set to Admin, whoever opens this app is treated as one. " +
-        "Add yourself on the People screen to close it."
-      : "";
-  $("#demoBar").hidden = !(localMode() || bootstrapping);
+  $("#demoBar").innerHTML = bootstrapping
+    ? '<strong>No Admin in the directory yet.</strong> Until a row in <code>' + esc(LIST_TITLES.advisers) +
+      "</code> has <code>AccessRole</code> set to Admin, whoever opens this app is treated as one. " +
+      "Add yourself on the People screen to close it."
+    : "";
+  $("#demoBar").hidden = !bootstrapping;
   /* The client table scrolls inside itself, and every edit rebuilds the page.
      Without this, setting a fee on the twentieth client throws you back to the
      first one — which is most of the work of a review. */
@@ -3756,7 +3551,7 @@ function render() {
   renderedView = state.view;
 }
 
-/* "Aldridge, Petra" reads as PA, not AP — surname-first is the Xplan convention. */
+/* "Surname, First" reads as FS, not SF — surname-first is the Xplan convention. */
 function initials(name) {
   const parts = String(name || "").split(/[,\s]+/).filter(Boolean);
   if (!parts.length) return "?";
@@ -3778,17 +3573,6 @@ function renderTopActions() {
       keys.map(k => '<option value="' + k + '"' + (k === state.runKey ? " selected" : "") + ">" + esc(monthLabel(k)) + "</option>").join("") +
       "</select>";
   }
-  if (localMode()) {
-    if (can("ownBook")) {
-      const inRun = advisersInRun();
-      html += '<select id="asAdviser" style="width:auto;min-width:200px" title="Stand in as a different adviser. Testing only — replaced by the signed-in account.">' +
-        inRun.map(a => '<option value="' + esc(a) + '"' + (a === state.asAdviser ? " selected" : "") + ">" + esc(a) + "</option>").join("") +
-        "</select>";
-    }
-    html += '<div class="seg" title="Switch role. Testing only — replaced by AccessRole in the adviser directory.">' +
-      ROLES.map(r => '<button data-role="' + r + '"' + (state.role === r ? ' class="on"' : "") + ">" + esc(r) + "</button>").join("") +
-      "</div>";
-  }
   if (run && can("approve")) {
     if (run.status === "Draft") html += '<button class="btn sky" id="btnOpen">Open for review</button>';
     if (run.status === "Open for Review") html += '<button class="btn" id="btnLock">Lock run</button>';
@@ -3798,16 +3582,12 @@ function renderTopActions() {
 
   const pick = $("#runPick");
   if (pick) pick.addEventListener("change", e => openRun(e.target.value));
-  const asPick = $("#asAdviser");
-  if (asPick) asPick.addEventListener("change", e => { state.asAdviser = e.target.value; state.expanded = {}; saveUi(); render(); });
-  $("#topActions").querySelectorAll("[data-role]").forEach(b =>
-    b.addEventListener("click", () => { state.role = b.dataset.role; state.expanded = {}; saveUi(); render(); }));
   const setStatus = s => { const r = currentRun(); if (r) { r.status = s; saveRuns(); render(); toast("Run is now " + s + ".", "good"); } };
   if ($("#btnOpen")) $("#btnOpen").addEventListener("click", async () => {
     const r = currentRun();
     if (!r) return;
     const advisers = new Set((state.calc ? state.calc.masters : []).map(m => m.adviser).filter(Boolean));
-    if (!localMode() && advisers.size && !confirm(
+    if (advisers.size && !confirm(
       "Open " + monthLabel(r.key) + " for review?\n\n" + advisers.size +
       " adviser" + (advisers.size === 1 ? "" : "s") + " will be emailed now, and chased in " +
       REMINDER_DAYS + " days if they have not finished.")) return;
@@ -3844,30 +3624,14 @@ function viewRun() {
   if (!state.rateCard.categories.length) {
     html += '<div class="banner bad no-print"><strong>No rate card yet.</strong> Nothing can be priced until the categories exist. ' +
       'Add them on the <strong>Rate/Fee Settings</strong> screen, or connect to SharePoint and they load from the list.</div>';
-  } else if (state.rateCard.isSample) {
-    html += '<div class="banner warn no-print"><strong>Sample pricing.</strong> The rate card holds made-up figures so the platform ' +
-      'can be tried out. Replace them on the <strong>Rate/Fee Settings</strong> screen before trusting any number on this page.</div>';
-  }
-
-  if (run && run.isSample) {
-    html += '<div class="banner warn no-print"><strong>Showing sample data.</strong> 25 fictional clients, so you can try everything ' +
-      'without a real extract. Drop your Xplan report above to replace it.</div>';
-  }
-
-  if (!CONFIG.clientId) {
-    html += '<div class="banner info no-print"><strong>Local mode.</strong> Everything is calculated and stored in this browser. ' +
-            'Once IT registers the Entra app and provisions the SharePoint lists in <code>SETUP.md</code>, paste the client ID into ' +
-            '<code>CONFIG.clientId</code> and the same screens read and write SharePoint instead.</div>';
-  }
+    }
 
   html += '<div class="card no-print"><div class="card-h"><h2>Load the monthly extract</h2>' +
     '<div class="sub">Xplan &rarr; Fee Calculator Data report, saved as .xlsx or .csv</div></div>' +
     '<div class="card-b"><div class="drop" id="drop"><h3>Drop the report here</h3>' +
     '<p>or click to choose a file &mdash; the 12 Xplan columns are matched by header, not position</p></div>' +
     '<input type="file" id="fileInput" accept=".xlsx,.csv" class="hide">' +
-    '<div class="spacer"></div><div class="toggle-row"><button class="btn ghost btn-sm" id="btnSample">Load sample data</button>' +
-    '<span class="small muted">25 fictional clients in the same shape as the Xplan report &mdash; for trying the platform out without a real extract.</span>' +
-    "</div></div></div><div class=\"spacer\"></div>";
+    "</div></div><div class=\"spacer\"></div>";
 
   if (!run) return html + '<div class="banner warn">No run loaded yet. Drop a report above to get started.</div>';
 
@@ -4001,11 +3765,10 @@ function viewReview() {
    once they have submitted or the run has been locked. */
 function viewMyClients() {
   const run = currentRun(), c = state.calc, me = state.asAdviser;
-  if (!me) return '<div class="banner warn">No advisers in this run yet.</div>';
+  if (!me) return '<div class="banner warn">You are signed in but not matched to an adviser record, ' +
+    "so there is no book to show. Ask Advice Operations to check your row in the directory.</div>";
 
-  let html = '<div class="banner info no-print"><strong>Demo.</strong> Use the picker in the top bar to stand in as a different adviser. ' +
-    'In the live app there is no picker &mdash; you are whoever you signed in as, and you only ever see your own clients.' +
-    (run.isSample ? " These clients are fictional sample data." : "") + "</div>";
+  let html = "";
 
   /* A run still being prepared is not an adviser's business. */
   if (run.status === "Draft") {
@@ -4742,7 +4505,7 @@ function viewApprovals() {
        directory was wrong at that moment nothing was written and the button
        that would have done it is gone. This re-runs it for anybody still
        without one, and is safe to press repeatedly. */
-    (run.status === "Open for Review" && can("approve") && !localMode()
+    (run.status === "Open for Review" && can("approve")
       ? '<button class="btn ghost" id="btnNotify">Notify advisers</button>' : "") +
     '<button class="btn ghost" id="btnRemindAll">Copy chase list</button></div></div>' +
     '<div class="tbl-wrap"><table><thead><tr><th></th><th>Adviser</th><th>Region</th><th class="num">Clients</th>' +
@@ -4779,9 +4542,7 @@ function viewApprovals() {
            only thing that reaches someone whose work was sent back after they
            had submitted — their scheduled reminder is gone by then. */
         (["Not started", "In progress", "Returned"].includes(st.status)
-          ? ' <button class="btn ghost btn-sm" data-remind="' + esc(a) + '"' +
-            (localMode() ? " disabled title=\"Needs a connection — local mode sends nothing.\"" : "") +
-            ">Send reminder</button>"
+          ? ' <button class="btn ghost btn-sm" data-remind="' + esc(a) + '">Send reminder</button>'
           : "") +
       "</td></tr>";
 
@@ -6076,7 +5837,7 @@ function viewSettings() {
   html += '<div class="card"><div class="card-h"><h2>Reference data</h2></div><div class="card-b">' +
     '<div class="kv"><div class="k">Rate card</div><div class="v">' +
       (state.rateCard.categories.length
-        ? state.rateCard.categories.length + " categories" + (state.rateCard.isSample ? " (sample)" : "")
+        ? state.rateCard.categories.length + " categories"
         : "not set") + "</div>" +
     '<div class="k">Advisers</div><div class="v">' +
       (state.advisers.length ? state.advisers.length + " listed" : "not set") + "</div></div>" +
@@ -6159,17 +5920,6 @@ function wire() {
     });
     fileInput.addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
   }
-  if ($("#btnSample")) $("#btnSample").addEventListener("click", () => {
-    const monthKey = defaultMonth();
-    if (state.runs[monthKey] && !confirm("A run already exists for " + monthLabel(monthKey) + ". Replace it with the sample?")) return;
-    const rows = sampleRows();
-    installSampleReference();
-    state.runs[monthKey] = newRun(monthKey, rows, SAMPLE_LABEL);
-    state.runs[monthKey].status = "Open for Review";   // so the adviser view has something to show
-    state.runKey = monthKey;
-    saveRuns(); saveUi(); render();
-    toast(rows.length + " sample rows loaded. Nothing here is a real client.", "good");
-  });
 
   /* --- review edits --- */
   document.querySelectorAll("[data-mo]").forEach(el => {
@@ -6263,16 +6013,16 @@ function wire() {
     el.addEventListener("click", () => openAddFundDialog(el.dataset.addfund)));
   document.querySelectorAll("[data-payall]").forEach(el =>
     el.addEventListener("click", () => openPayAllDialog(el.dataset.payall)));
-  /* Comments grow with what is typed rather than hiding it behind a scrollbar. */
-  document.querySelectorAll("textarea.grow").forEach(el => {
-    const fit = () => { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 220) + "px"; };
-    el.addEventListener("input", fit);
-    fit();
-  });
-  document.querySelectorAll("input.grow-x").forEach(el => {
-    fitInputWidth(el);
-    el.addEventListener("input", () => fitInputWidth(el));
-  });
+  /* Comments grow with what is typed rather than hiding it behind a scrollbar.
+     Sized in one batch on render; on a keystroke only the one box being typed
+     into is touched. */
+  const areas = [...document.querySelectorAll("textarea.grow")];
+  fitTextareas(areas);
+  areas.forEach(el => el.addEventListener("input", () => fitTextareas([el])));
+
+  const grows = [...document.querySelectorAll("input.grow-x")];
+  fitInputWidths(grows);
+  grows.forEach(el => el.addEventListener("input", () => fitInputWidths([el])));
   document.querySelectorAll("[data-exp]").forEach(el =>
     el.addEventListener("click", () => {
       state.expanded[el.dataset.exp] = !state.expanded[el.dataset.exp];
@@ -6796,17 +6546,9 @@ function openImportDialog(fileName, recs, missing) {
     state.runKey = monthKey;
     saveUi();
 
-    if (localMode()) {
-      saveRuns();
-      render();
-      toast(recs.length.toLocaleString("en-AU") + " rows imported for " + monthLabel(monthKey) + ".", "good");
-      celebrate();
-      return true;
-    }
-
-    /* Connected, an import is three writes and none of them is a keystroke, so
-       it runs now rather than through the debounce — and the extract goes to
-       the library as a file, not as 1,800 list items. */
+    /* An import is three writes and none of them is a keystroke, so it runs now
+       rather than through the debounce — and the extract goes to the library as
+       a file, not as 1,800 list items. */
     publishRun(monthKey, recs, fileName, existed);
     return true;
   }, () => {
@@ -7110,10 +6852,6 @@ function buildReport(opts) {
     (run.sourceName ? "<span><b>Source</b> " + esc(run.sourceName) + "</span>" : "") +
     "<span><b>Prepared</b> " + esc(now) + "</span></div>";
 
-  if (run.isSample) {
-    h += '<div class="note"><b>Sample data.</b> Every client, figure and adviser name in this report is ' +
-      "fictional. It is not a record of anything.</div>";
-  }
   h += '<div class="rep-sum">' +
     '<div><div class="k">Total FUM</div><div class="v">' + money(totFum) + "</div></div>" +
     '<div><div class="k">Current fees</div><div class="v">' + money(totCur) + "</div></div>" +
@@ -7359,7 +7097,7 @@ async function download(text, name, mime) {
    month. It is labelled everywhere it appears and the first real extract
    replaces it.
    ========================================================================= */
-loadAll();
+loadUiPrefs();
 
 applyTheme();
 /* System → Light → Dark → System. Three states because "follow the OS" is a
@@ -7384,33 +7122,18 @@ addEventListener("resize", () => {
   measureTopbar();                 // the bar rewraps, so the pinned panel's offset moves with it
 });
 
-/* Sample data belongs to local mode only. Connected, the site is the source of
-   truth and an invented run would be indistinguishable from a real one. */
-if (localMode()) {
-  if (!Object.keys(state.runs).length) {
-    const key = defaultMonth();
-    state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
-    state.runs[key].status = "Open for Review";
-    state.runKey = key;
-    saveRuns(); saveUi();
-  }
-  /* Sample runs are disposable, so bring any stale one up to date rather than
-     leaving it pointing at advisers and pricing that no longer exist. */
-  for (const [key, run] of Object.entries(state.runs)) {
-    if (run.isSample && run.sampleVersion !== SAMPLE_VERSION) {
-      state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
-      state.runs[key].status = run.status || "Open for Review";
-    }
-  }
-  if (currentRun() && currentRun().isSample) installSampleReference();
-  saveRuns();
-  render();
+/* Nothing is drawn until somebody has signed in and been resolved against the
+   directory. Coming back from the Entra redirect there is already an account in
+   the cache, so pick straight up rather than making somebody press sign in
+   twice; otherwise show the gate and wait to be asked. */
+if (!connected()) {
+  /* Deployed without a client ID, so sign-in is impossible. Saying so beats a
+     gate whose button can never work. */
+  state.authState = "error";
+  state.authError = "This copy of the platform has no Entra client ID set, so it cannot sign anybody in. " +
+    "It needs configuring before use — send this message to whoever deployed it.";
+  renderGate();
 } else {
-  state.runs = {};
-  state.runKey = null;
-  /* Coming back from the Entra redirect there is already an account in the
-     cache, so pick straight up rather than making somebody press sign in
-     twice. Otherwise show the gate and wait to be asked. */
   renderGate();
   ensureMsal()
     .then(app => { if (app.getActiveAccount()) return startSession(); })
