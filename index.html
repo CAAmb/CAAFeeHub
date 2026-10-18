@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CAA Fee Calculator Platform</title>
+<title>CAA Fee Hub</title>
 <link rel="icon" href="favicon.png">
 <!-- Content Security Policy. Nothing is fetched from a CDN at runtime: the XLSX
      reader is hand-rolled against the browser's own DecompressionStream, so the
@@ -299,8 +299,6 @@ body.gate main.page{display:grid;place-items:center;padding:24px;min-height:100v
 .gate-card h2{font-size:1.3rem;margin-bottom:8px;letter-spacing:-.01em}
 .gate-card .lead{color:var(--ink-2);font-size:.88rem;line-height:1.55;margin-bottom:22px}
 .gate-card .btn{width:100%;padding:12px 18px;font-size:.78rem}
-.gate-card .foot{margin-top:20px;padding-top:16px;border-top:1px solid var(--line);
-  font-size:.72rem;color:var(--ink-muted);word-break:break-word}
 .gate-card .banner{text-align:left;margin:0 0 18px}
 .gate-card .kv{text-align:left;margin-bottom:18px}
 /* A spinner rather than a static word, so a slow tenant does not look stuck. */
@@ -633,13 +631,14 @@ td input.num{text-align:right}
 <script>
 "use strict";
 /* =========================================================================
-   CAA Fee Calculator Platform — Coastal Advisory
-   Single-file SPA. Phase 1 runs entirely in the browser: drop the monthly
-   Xplan extract in, the engine reproduces the workbook's column M–AK maths,
-   and advisers review by master client rather than by subfund row.
+   CAA Fee Hub — Coastal Advisory
+   Single-file SPA. The monthly Xplan extract goes in, the engine reproduces the
+   workbook's column M–AK maths, and advisers review by master client rather
+   than by subfund row. Alongside it, the Pricing Calculator quotes new and
+   existing clients and prices an insurance claim.
 
-   Phase 2 swaps the storage layer for MSAL → Graph → SharePoint. Every read
-   and write already goes through store.* so only that object changes.
+   Storage is MSAL → Graph → SharePoint throughout; every read and write goes
+   through store.*, which is the only object that knows that.
    ========================================================================= */
 
 /* ---------------- configuration ----------------
@@ -820,9 +819,26 @@ const EXPECTED_SCHEMA = {
      min            applies once on its own, no quantity
      each           multiplied by however many the adviser enters
      hour           multiplied by hours
+     year           multiplied by however many, charged every year
    and `suppressesMin` marks an each-line that cancels its section's minimum —
    an insurance-only engagement does not also carry the base SOA fee. */
 const PRICE_KINDS = ["min", "each", "hour"];
+
+/* Coastal's other services — accounting, lending and the like. They are priced
+   lines like any other and live in the same `items` list under their own
+   section, but they are quoted the three ways the business sells them rather
+   than the three ways an advice fee is built. `year` is arithmetically `each`:
+   a quantity times a price. It differs only in how it reads and which subtotal
+   it lands in.
+
+   They are deliberately NOT part of Total upfront or Total ongoing. The service
+   package is chosen by the ongoing fee and the FUM percentage is measured
+   against it, so folding an accounting retainer in would climb a client into a
+   tier they have not earned and read their advice fee as higher than it is. */
+const ANCILLARY = "ancillary";
+const ANCILLARY_KINDS = ["each", "hour", "year"];
+const KIND_LABEL = { min: "once", each: "per item", hour: "per hour", year: "per year" };
+const ANCILLARY_LABEL = { each: "one-off", hour: "hourly", year: "ongoing" };
 
 const EMPTY_PRICING = {
   reviewed: "",                       // "30 June 2026", shown on the screen
@@ -3411,8 +3427,8 @@ async function startSession() {
 function renderGate() {
   const id = state.identity;
   document.body.classList.add("gate");
-  $("#pgTitle").textContent = "CAA Fee Calculator";
-  $("#pgSub").textContent = CONFIG.sitePath.split(":/").pop();
+  $("#pgTitle").textContent = "CAA Fee Hub";
+  $("#pgSub").textContent = "";
   $("#nav").innerHTML = "";
   $("#topActions").innerHTML = "";
   $("#demoBar").hidden = true;
@@ -3421,10 +3437,11 @@ function renderGate() {
   $("#whoAvatar").textContent = id ? initials(id.name) : "?";
 
   /* The brand mark, then whatever this particular state needs to say. Same
-     shell every time so the screen does not jump between states. */
+     shell every time so the screen does not jump between states. No footer:
+     it used to print the SharePoint site path, which is infrastructure nobody
+     signing in needs and everybody looking over a shoulder can read. */
   const card = b => '<div class="gate-card">' +
-    '<img class="mark" src="' + logoSrc() + '" alt="Coastal Advisory Australia">' + b +
-    '<div class="foot">' + esc(CONFIG.sitePath.split(":/").pop()) + "</div></div>";
+    '<img class="mark" src="' + logoSrc() + '" alt="Coastal Advisory Australia">' + b + "</div>";
   let html = "";
 
   if (state.authState === "signing-in") {
@@ -3461,9 +3478,9 @@ function renderGate() {
       "clients will not find them.</div>" +
       '<button class="btn ghost" id="btnRetryAuth">Check again</button>');
   } else {
-    html = card("<h2>Fee Calculator</h2>" +
-      '<div class="lead">The monthly adviser fee review. Pricing, people and runs all live in ' +
-      "SharePoint, so it needs to know who you are.</div>" +
+    html = card("<h2>Fee Hub</h2>" +
+      '<div class="lead">The monthly adviser fee review and the pricing calculator. Pricing, ' +
+      "people and runs are all held centrally, so it needs to know who you are.</div>" +
       '<button class="btn sky" id="btnSignIn">Sign in with Microsoft</button>');
   }
 
@@ -4637,6 +4654,9 @@ const pricingInputs = {
   open: { reference: false }
 };
 
+/* The advice fee sections, which is also the order the Line items editor shows
+   them in. ANCILLARY is deliberately absent: it is edited on its own card and
+   totalled on its own, because it is not an advice fee. */
 const PRICE_SECTIONS = [
   { id: "soa",    label: "SOA fees",        group: "Upfront" },
   { id: "impl",   label: "Implementation",  group: "Upfront" },
@@ -4667,6 +4687,18 @@ function priceAdvice() {
   const sum = s => items.filter(i => i.section === s).reduce((a, i) => a + i.amount, 0);
   const soa = sum("soa"), impl = sum("impl"), csa = sum("csa"), hourly = sum("hourly");
 
+  /* Ancillary splits by how often it is charged rather than by section, because
+     a one-off lending fee and an annual accounting retainer are two different
+     numbers and adding them together would be arithmetic nobody asked for.
+     `ancSet` is whether any are configured at all — the section and its card
+     appear on that, not on whether a quantity has been typed, so the figures
+     can repaint in place instead of the card arriving mid-keystroke. */
+  const ancSum = yearly => items
+    .filter(i => i.section === ANCILLARY && (i.kind === "year") === yearly)
+    .reduce((a, i) => a + i.amount, 0);
+  const ancOnce = ancSum(false), ancYear = ancSum(true);
+  const ancSet = items.some(i => i.section === ANCILLARY);
+
   const ladder = ((p.ladders || {})[ct] || []).map(b => ({ from: num(b.from), rate: num(b.rate) }));
   const fum = num(pricingInputs.fum);
   const fumFee = ladder.length ? surchargeFor(fum, ladder) : 0;
@@ -4686,7 +4718,7 @@ function priceAdvice() {
   const centrelink = src ? num(pricingInputs.meansTested ? src.mtf : src.cas) : null;
 
   return { items, soa, impl, csa, hourly, ladder, fum, fumFee, ongoing, upfront,
-           pack, centrelink, packs,
+           pack, centrelink, packs, ancOnce, ancYear, ancSet,
            pctOfFum: fum > 0 ? ongoing / fum : null };
 }
 
@@ -4723,6 +4755,20 @@ const quoteCard = (k, v, n) =>
   '<div class="q"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" +
   '<div class="n">' + esc(n || "") + "</div></div>";
 const quoteHead = cells => '<div class="quote-head"><div class="quote-grid">' + cells + "</div></div>";
+
+/* One card carrying two different kinds of money. Leading with whichever is
+   actually on the quote beats showing $0 beside a real annual figure, so a
+   client with only a retainer sees the retainer. Shared with paintPricing() so
+   the pinned panel and a rebuild cannot word it differently. */
+function ancCard(a) {
+  const yearOnly = !a.ancOnce && a.ancYear;
+  return {
+    v: money(yearOnly ? a.ancYear : a.ancOnce),
+    n: yearOnly ? "per year, outside both totals"
+      : a.ancYear ? "plus " + money(a.ancYear) + " per year"
+      : "one-off, outside both totals"
+  };
+}
 
 const pricingTabBtn = (id, label) =>
   '<button class="btn' + (pricingInputs.tab === id ? "" : " ghost") + '" data-ptab="' + id + '">' + esc(label) + "</button>";
@@ -4786,9 +4832,10 @@ function priceRow(it) {
       '<button type="button" data-pstep="' + esc(it.id) + '" data-d="1" ' +
       'aria-label="One more ' + esc(it.label) + '">+</button></span>';
   const amount = lineAmount(it);
+  const per = { hour: "/hr", year: "/yr" }[it.kind] || "";
   return '<div class="rrow' + (amount === null ? " off" : "") + '"><span class="lbl">' + esc(it.label) +
     (it.note ? '<span class="rnote">' + esc(it.note) + "</span>" : "") + "</span>" + ctl +
-    '<span class="price">' + money(it.price) + (it.kind === "hour" ? "/hr" : "") + "</span>" +
+    '<span class="price">' + money(it.price) + per + "</span>" +
     '<span class="amt" data-pamt="' + it.i + '">' + amt(amount) + "</span></div>";
 }
 
@@ -4818,7 +4865,10 @@ function pricingAdviceView(p) {
     quoteCard("Fee as % of FUM", a.pctOfFum === null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%",
               a.fum > 0 ? "on " + money(a.fum) : "enter FUM below") +
     quoteCard("Service package", a.pack ? a.pack.name : "—",
-              a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee"));
+              a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee") +
+    /* Shown whenever ancillary services exist, not whenever one is used: a card
+       that appears halfway through typing moves everything beside it. */
+    (a.ancSet ? quoteCard("Ancillary services", ancCard(a).v, ancCard(a).n) : ""));
 
   /* The two inputs that move nearly every figure, lifted out of the sections
      they used to be buried in. */
@@ -4878,6 +4928,25 @@ function pricingAdviceView(p) {
     (pricingInputs.onAgreement ? (a.pack ? esc(a.pack.name) : "no package") : "no agreement") +
     "</strong>. Payable personally by direct debit or invoice, never included in the Client Service Agreement, " +
     "and not part of either total above.");
+
+  /* Coastal's other services, at the bottom and on the same screen, so a quote
+     covering advice and accounting is one conversation. Split by how often each
+     is charged — the two numbers are not addable — and each half only appears
+     if something is set up for it. */
+  const ancRows = yearly => a.items.filter(i => i.section === ANCILLARY && (i.kind === "year") === yearly);
+  if (a.ancSet) {
+    const outside = "Coastal's other services, priced separately from advice. <strong>Outside both totals above</strong> " +
+      "&mdash; the service package and the FUM percentage are measured on the advice fee alone.";
+    if (ancRows(false).length) {
+      html += rowSection("Ancillary services — one-off", "ptAncOnce", a.ancOnce,
+        ancRows(false).map(priceRow).join(""), outside);
+    }
+    if (ancRows(true).length) {
+      html += rowSection("Ancillary services — every year", "ptAncYear", a.ancYear,
+        ancRows(true).map(priceRow).join(""),
+        ancRows(false).length ? "Charged every year for as long as the service runs." : outside);
+    }
+  }
 
   html += "</div></div>";
   html += pricingReference(p);
@@ -5068,8 +5137,10 @@ function paintPricing() {
   set("#ptFum", money(a.fumFee));
   set("#ptOngoing", money(a.ongoing));
   set("#ptCentrelink", money(a.centrelink));
+  set("#ptAncOnce", money(a.ancOnce));
+  set("#ptAncYear", money(a.ancYear));
 
-  /* The four headline figures in the pinned panel move with every keystroke too. */
+  /* The headline figures in the pinned panel move with every keystroke too. */
   const vals = document.querySelectorAll(".quote-grid .v");
   const notes = document.querySelectorAll(".quote-grid .n");
   if (vals.length >= 4) {
@@ -5080,6 +5151,12 @@ function paintPricing() {
     if (notes.length >= 4) {
       notes[2].textContent = a.fum > 0 ? "on " + money(a.fum) : "enter FUM below";
       notes[3].textContent = a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee";
+    }
+    /* The fifth card is there only when ancillary services are set up. */
+    if (vals.length >= 5) {
+      const ac = ancCard(a);
+      vals[4].textContent = ac.v;
+      if (notes.length >= 5) notes[4].textContent = ac.n;
     }
   }
 }
@@ -5334,6 +5411,9 @@ function pricingSections(ro) {
     '<div class="no-print" style="margin:0 0 10px"><button class="btn ghost btn-sm" ' + attrs + ">" + label + "</button></div>";
 
   const items = p.items || [];
+  /* Carries each service's index in `items`, because the editing handlers write
+     back by position in that one list and this is a filtered view of it. */
+  const anc = items.map((it, i) => ({ it, i })).filter(x => x.it.section === ANCILLARY);
   const ladders = p.ladders || {};
   const cl = p.claims || {};
   const refs = p.reference || [];
@@ -5374,7 +5454,7 @@ function pricingSections(ro) {
                   esc(it.label || "") + '"' + ro + "></td>" +
                 '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
                   PRICE_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
-                    { min: "once", each: "per item", hour: "per hour" }[k] + "</option>").join("") + "</select></td>" +
+                    KIND_LABEL[k] + "</option>").join("") + "</select></td>" +
                 '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
                   '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
                 '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
@@ -5390,6 +5470,39 @@ function pricingSections(ro) {
           "<strong>Once</strong> lines apply on their own with no quantity; <strong>cancels minimum</strong> marks a line that " +
           "waives its section's once-line when it is used, which is how an insurance-only engagement escapes the base SOA fee.</div>";
       } },
+
+    { key: "p-anc", title: "Ancillary services",
+      sub: "Coastal's other services — accounting, lending and the like",
+      meta: anc.length + " service" + (anc.length === 1 ? "" : "s"),
+      actions: addBtn('data-peadd="anc"', "Add service"),
+      body: () =>
+        (anc.length
+          ? '<div class="tbl-scroll"><table><thead><tr><th>Service</th><th>Charged</th>' +
+            '<th class="num">NEW</th><th class="num">EXISTING</th><th>Note on the quote</th>' +
+            (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+            anc.map(({ it, i }) =>
+              '<tr><td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="label" value="' +
+                esc(it.label || "") + '" placeholder="Accounting"' + ro + "></td>" +
+              '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
+                ANCILLARY_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
+                  ANCILLARY_LABEL[k] + "</option>").join("") + "</select></td>" +
+              '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+                '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
+              '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+                '" data-f="existingPrice" value="' + priceBox(it.existingPrice) + '" placeholder="n/a"' + ro + "></td>" +
+              '<td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="note" value="' +
+                esc(it.note || "") + '" placeholder="optional"' + ro + "></td>" +
+              del("item", i) + "</tr>").join("") + "</tbody></table></div>"
+          : '<div class="muted">No ancillary services set, so the section does not appear on the calculator.</div>') +
+        '<div class="spacer"></div><div class="small muted">These are services Coastal provides and bills for, quoted ' +
+        "alongside advice but priced on their own. <strong>One-off</strong> and <strong>hourly</strong> are counted by the " +
+        "adviser; <strong>ongoing</strong> is charged every year for as long as the service runs." +
+        "<br><br>An empty price box means the service is <strong>not offered</strong> to that client type &mdash; different " +
+        "from a price of zero. The note prints under the service name on the quote, which is the place to say what triggers " +
+        "the fee or what it covers." +
+        "<br><br>They sit <strong>outside Total upfront and Total ongoing</strong>, on purpose: the service package is chosen " +
+        "by the advice ongoing fee and the FUM percentage is measured against it, so counting an accounting retainer there " +
+        "would push a client into a tier they have not earned.</div>" },
 
     { key: "p-ladders", title: "FUM ladders",
       sub: "Marginal bands, one ladder per client type",
@@ -6161,7 +6274,7 @@ function wire() {
 
   /* --- pricing editor, on Rate/Fee Settings --- */
   const pr = () => state.rateCard.pricing || (state.rateCard.pricing = JSON.parse(JSON.stringify(EMPTY_PRICING)));
-  const PE_TEXT = ["label", "name", "title", "body", "kind", "reviewed"];
+  const PE_TEXT = ["label", "name", "title", "body", "kind", "note", "reviewed"];
 
   document.querySelectorAll("[data-pe]").forEach(el =>
     el.addEventListener("change", () => {
@@ -6195,6 +6308,10 @@ function wire() {
           p.items.push({ id: newItemId(p.items), section: el.dataset.sec, label: "New line",
                          kind: el.dataset.sec === "hourly" ? "hour" : "each",
                          newPrice: 0, existingPrice: 0, suppressesMin: false, note: "" });
+          break;
+        case "anc":
+          p.items.push({ id: newItemId(p.items), section: ANCILLARY, label: "New service",
+                         kind: "each", newPrice: 0, existingPrice: 0, suppressesMin: false, note: "" });
           break;
         case "ladder":
           (p.ladders[el.dataset.ct] = p.ladders[el.dataset.ct] || [])
