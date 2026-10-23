@@ -1770,32 +1770,55 @@ async function clearCsaStatus(threadId) {
   if (id && sp.lists.csa) await spDelete("csa", id);
 }
 
-/* Publishing a dump is also where the platform and Xplan are reconciled.
-
-   A thread that has gone from the report has been actioned: its mark-off row is
-   deleted, which is the only tidying this list ever needs. A thread somebody
-   ticked that is STILL in the report is stamped as disputed — the tick and
-   Xplan disagree, and that has to surface rather than quietly hold the chase
-   off forever. */
+/* Uploading writes the file and nothing else. It used to reconcile the
+   mark-offs at the same moment, which meant a wrong report — last month's, or
+   somebody else's — deleted advisers' ticks the instant it landed, and deleting
+   the report afterwards could not bring them back. Now the report can be put
+   up, looked at and taken down again without anything else noticing. */
 async function publishCsa(recs, fileName, counts) {
   const payload = { takenAt: new Date().toISOString(), fileName: fileName || "",
                     notUnactioned: counts.notUnactioned || 0, rows: recs };
   await spPutFile(CSA_FILE, JSON.stringify(payload));
   state.csa = payload;
+}
 
-  const present = new Set(recs.map(r => r.threadId));
-  const now = new Date().toISOString();
+/* The platform and Xplan agree with each other here, at Queue reminders —
+   the point where somebody has looked at the report and committed to it.
+
+   A thread that has gone from the report has been actioned: its mark-off row is
+   deleted, which is the only tidying this list ever needs. A thread somebody
+   ticked before this report and is STILL on it has the date that started
+   written down, so the one-cycle grace runs from a fixed day rather than
+   restarting with every new report. */
+async function reconcileCsa() {
+  const dump = state.csa;
+  if (!dump || !Array.isArray(dump.rows)) return { confirmed: 0, disputed: 0 };
+  const present = new Set(dump.rows.map(r => r.threadId));
   let confirmed = 0, disputed = 0;
   for (const id of Object.keys(state.csaStatus)) {
     const st = state.csaStatus[id];
     if (!present.has(id)) { await clearCsaStatus(id); confirmed++; continue; }
-    if (st.markedAt && !st.disputedAt) {
-      st.disputedAt = now;
+    const since = csaDisputedAt(st, dump.takenAt);
+    if (since && !st.disputedAt) {
+      st.disputedAt = since;
       await writeCsaStatus(st);
       disputed++;
     }
   }
   return { confirmed, disputed };
+}
+
+/* Takes the report down. The file goes to the site's recycle bin rather than
+   being overwritten, so a report removed by mistake can be restored from there
+   for 93 days. Mark-offs are left exactly as they were — they are advisers'
+   work, and nothing a report does at upload touches them any more. */
+async function removeCsaReport() {
+  const token = await getToken(false);
+  const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
+    "/root:/" + encodeURI(CSA_FILE), { method: "DELETE", headers: { Authorization: "Bearer " + token } });
+  /* Already gone is the outcome being asked for, not a failure. */
+  if (!res.ok && res.status !== 404) throw new Error("Could not remove the report (" + res.status + " " + res.statusText + ").");
+  state.csa = null;
 }
 
 /* ---- writes ----
@@ -3093,14 +3116,27 @@ function csaStage(due, today) {
 const CSA_STAGE_LABEL = { upcoming: "Not yet due", soon: "Due soon", due: "Due now",
                           overdue: "Overdue", unknown: "No due date" };
 
-/* A ticked CSA stops being chased. If next week's dump still carries it, the
+/* When the report started disagreeing with a tick: a CSA marked signed BEFORE
+   this report was taken and still on it. Worked out on the spot rather than
+   written at upload, so a wrong report can be deleted without leaving its
+   verdicts behind in the list. Queue reminders is what writes it down — see
+   reconcileCsa() — because the date it started has to survive the next dump,
+   or the grace period below would restart every week and never run out. */
+function csaDisputedAt(st, takenAt) {
+  if (!st || !st.markedAt) return "";
+  if (st.disputedAt) return st.disputedAt;
+  return takenAt && Date.parse(st.markedAt) < Date.parse(takenAt) ? takenAt : "";
+}
+
+/* A ticked CSA stops being chased. If a later report still carries it, the
    tick and the report disagree: it comes back flagged, and the chase resumes
    one cycle later rather than immediately, so nobody is chased over the gap
    between signing in Xplan and the next dump. */
-function csaSuppressed(st, today) {
+function csaSuppressed(st, today, takenAt) {
   if (!st || !st.markedAt) return false;
-  if (!st.disputedAt) return true;
-  return daysBetween(st.disputedAt.slice(0, 10), today) < CSA_DISPUTE_GRACE_DAYS;
+  const since = csaDisputedAt(st, takenAt);
+  if (!since) return true;
+  return daysBetween(localDay(since), today) < CSA_DISPUTE_GRACE_DAYS;
 }
 
 /* =========================================================================
@@ -3141,7 +3177,9 @@ function buildCsa() {
       expiredDays, expired: expiredDays > 0,
       daysToDue: r.due ? daysBetween(today, r.due) : null,
       stage: csaStage(r.due, today),
-      marked: st, suppressed: csaSuppressed(st, today)
+      marked: st,
+      disputedAt: csaDisputedAt(st, dump.takenAt),
+      suppressed: csaSuppressed(st, today, dump.takenAt)
     };
   });
 
@@ -3159,7 +3197,7 @@ function buildCsa() {
     notUnactioned: dump.notUnactioned || 0,
     items, live,
     marked: items.filter(i => i.marked),
-    disputed: items.filter(i => i.marked && i.marked.disputedAt),
+    disputed: items.filter(i => i.disputedAt),
     expired: live.filter(i => i.expired),
     /* By stage rather than by counting days, so the card and the emails agree:
        the first reminder rolls back to a Friday, and a CSA nine days out on a
@@ -5466,8 +5504,8 @@ function csaRow(i) {
     (i.mismatch ? '<span class="pill warn" title="The fee run says ' + esc(i.adviser) +
       '; the Xplan task says ' + esc(i.taskAdviser) + '">adviser differs</span> ' : "") +
     (!i.master ? '<span class="pill warn" title="No matching client in the current fee run">not in run</span> ' : "") +
-    (i.marked && i.marked.disputedAt
-      ? '<span class="pill bad" title="Marked signed on ' + esc(dayLabel(i.marked.markedAt.slice(0, 10))) +
+    (i.disputedAt
+      ? '<span class="pill bad" title="Marked signed on ' + esc(dayLabel(localDay(i.marked.markedAt))) +
         ' but still on the report">still showing</span> '
       : i.marked ? '<span class="pill good">marked off</span> ' : "");
 
@@ -5542,10 +5580,18 @@ function csaExceptionBlocks(csa) {
 function viewCsa() {
   const csa = buildCsa();
 
+  /* What is loaded now, and the way to take it down, sit on the card used to
+     put one up — the two are the same job. */
+  const loaded = state.csa;
   const dropZone = can("csaLoad")
     ? '<div class="card"><div class="card-h"><h2>Weekly report</h2>' +
-      '<div class="sub">Xplan &rarr; Incomplete task report</div></div>' +
-      '<div class="card-b"><div class="drop" id="csaDrop"><h3>Drop the report here</h3>' +
+      '<div class="sub">' + (loaded
+        ? esc(loaded.fileName || "Report") + " &middot; loaded " + esc(dayLabel(localDay(loaded.takenAt)))
+        : "Xplan &rarr; Incomplete task report") + "</div>" +
+      (loaded ? '<div class="right no-print"><button class="btn ghost btn-sm" id="btnCsaRemove">Remove report</button></div>' : "") +
+      "</div>" +
+      '<div class="card-b"><div class="drop" id="csaDrop"><h3>' +
+        (loaded ? "Drop a new report to replace it" : "Drop the report here") + "</h3>" +
       "<p>or click to choose a file &mdash; the sheet is picked by its columns, so the " +
       "<em>CSA Baseline</em> tab is ignored</p></div>" +
       '<input type="file" id="csaFile" accept=".xlsx,.csv" class="hide"></div></div>' +
@@ -6934,6 +6980,7 @@ function wire() {
     el.addEventListener("click", () => undoCsaSigned(el.dataset.csaundo)));
 
   if ($("#btnCsaQueue")) $("#btnCsaQueue").addEventListener("click", queueCsaReminders);
+  if ($("#btnCsaRemove")) $("#btnCsaRemove").addEventListener("click", confirmRemoveCsa);
 
   /* --- review edits --- */
   document.querySelectorAll("[data-mo]").forEach(el => {
@@ -7591,16 +7638,62 @@ function openCsaImportDialog(fileName, recs, notUnactioned, noDue) {
 
   showDialog("Load CSA report", body, "Load report", async () => {
     try {
-      const res = await publishCsa(recs, fileName, { notUnactioned });
-      let msg = recs.length + " outstanding CSAs loaded.";
-      if (res.confirmed) msg += " " + res.confirmed + " previously marked off have cleared.";
-      if (res.disputed) msg += " " + res.disputed + " marked off are still on the report.";
-      toast(msg, "good");
+      await publishCsa(recs, fileName, { notUnactioned });
+      toast(recs.length + " outstanding CSAs loaded. Nothing has been sent.", "good");
       render();
     } catch (e) {
       toast("Could not save the report. " + ((e && e.message) || e), "bad");
     }
   });
+}
+
+/* Taking a report down cancels whatever it queued that has not gone yet: a
+   report somebody has decided not to act on should not keep chasing people
+   from the recycle bin. What has already been sent cannot be recalled, and the
+   dialog says so rather than implying otherwise.
+
+   Only if THIS report was queued, though. Queueing replaces everything
+   scheduled before it, so after a queue every waiting CSA reminder is this
+   report's. Before one, they all belong to the last report that was — and
+   removing a wrong upload must not cancel the right one's reminders. */
+async function confirmRemoveCsa() {
+  const dump = state.csa;
+  if (!dump) return;
+  /* Counted before asking, so the dialog states what will actually happen. */
+  let waiting = 0;
+  if (sp.lists.notifications) {
+    const kinds = new Set(CSA_STAGES.map(s => s.kind));
+    try {
+      waiting = (await spItems("notifications")).map(i => i.fields || {})
+        .filter(f => kinds.has(f.Kind) && f.NotifyStatus === "Scheduled").length;
+    } catch (e) { /* the count is a courtesy; the removal does not depend on it */ }
+  }
+
+  showDialog("Remove CSA report",
+    '<div class="kv" style="margin-bottom:16px">' +
+    '<div class="k">File</div><div class="v">' + esc(dump.fileName || "—") + "</div>" +
+    '<div class="k">Loaded</div><div class="v">' + esc(dayLabel(localDay(dump.takenAt))) + "</div>" +
+    '<div class="k">Outstanding CSAs</div><div class="v">' + (dump.rows || []).length + "</div></div>" +
+    "<p>The tracker goes empty until another report is loaded. Marked-off CSAs are kept.</p>" +
+    (!dump.queuedAt
+      ? '<div class="small muted">No reminders were queued from this report, so nobody has been emailed from it.' +
+        (waiting ? " The " + waiting + " still scheduled belong to an earlier report and are left alone." : "") + "</div>"
+      : waiting
+        ? '<div class="banner warn"><strong>' + waiting + " reminder" + (waiting === 1 ? "" : "s") +
+          " still waiting to go out will be cancelled.</strong> Anything already sent cannot be recalled.</div>"
+        : '<div class="small muted">Reminders from this report have already gone; nothing is waiting to be cancelled.</div>') +
+    '<div class="small muted" style="margin-top:10px">The file goes to the site recycle bin and can be restored from there. ' +
+    "If you only uploaded the wrong one, you can skip this &mdash; dropping the right report replaces it.</div>",
+    "Remove report", async () => {
+      try {
+        const cleared = (dump.queuedAt && waiting) ? await clearCsaQueue() : { cancelled: 0 };
+        await removeCsaReport();
+        toast("Report removed" + (cleared.cancelled ? ", " + cleared.cancelled + " reminders cancelled" : "") + ".", "good");
+      } catch (e) {
+        toast(((e && e.message) || e) + "", "bad");
+      }
+      render();
+    });
 }
 
 /* Marking one off asks for a reason the way removing a client from a review
@@ -7655,6 +7748,13 @@ async function queueCsaReminders() {
       "Anything still waiting from an earlier queue is replaced, and anything already sent today " +
       "is not sent again. Continue?")) return;
 
+  /* The report has been checked and committed to, so this is where the
+     mark-offs are squared with it. A failure here is reported but does not
+     stop the chase: the reminders above were planned from the same view. */
+  let rec = { confirmed: 0, disputed: 0 };
+  try { rec = await reconcileCsa(); }
+  catch (e) { toast("Could not update the marked-off list. " + ((e && e.message) || e), "bad"); }
+
   const cleared = await clearCsaQueue();
   const rows = planned.filter(r => !cleared.already.has(csaMsgKey(r.Adviser, r.Kind, r.DueAt)));
   const skipped = planned.length - rows.length;
@@ -7669,7 +7769,9 @@ async function queueCsaReminders() {
   }
   toast(sent + " queued" +
     (cleared.cancelled ? ", " + cleared.cancelled + " superseded" : "") +
-    (skipped ? ", " + skipped + " already sent" : "") + ".", sent || skipped ? "good" : "bad");
+    (skipped ? ", " + skipped + " already sent" : "") +
+    (rec.confirmed ? ". " + rec.confirmed + " marked-off CSA" + (rec.confirmed === 1 ? "" : "s") + " confirmed signed" : "") +
+    ".", sent || skipped ? "good" : "bad");
   render();
 }
 
