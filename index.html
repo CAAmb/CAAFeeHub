@@ -665,14 +665,19 @@ const LIST_TITLES = {
   funds:     "Fee Calculator Funds",
   /* Optional until the flows exist: the app degrades to writing nothing rather
      than failing, so the site works before the automation is built. */
-  notifications: "Fee Calculator Notifications"
+  notifications: "Fee Calculator Notifications",
+  /* Holds mark-offs only — a thread id, who ticked it and when. No client name
+     ever reaches it; the names live in the dump file and in memory, the same
+     way the fee extract is handled. */
+  csa: "Fee Calculator CSA"
 };
-const OPTIONAL_LISTS = ["notifications"];
+const OPTIONAL_LISTS = ["notifications", "csa"];
 
 /* The app never sends email. It writes a row and a Power Automate flow sends
    it, which keeps Mail.Send off this application's permissions, keeps the
    wording editable by the business, and leaves a record of every message. */
-const NOTIFY_KINDS = ["Review ready", "Reminder", "Completed", "Approved", "Returned"];
+const NOTIFY_KINDS = ["Review ready", "Reminder", "Completed", "Approved", "Returned",
+                      "CSA due soon", "CSA due today", "CSA overdue", "CSA outstanding"];
 const NOTIFY_STATUS = ["Scheduled", "Queued", "Sent", "Failed", "Cancelled"];
 const REMINDER_DAYS = 7;
 /* Goes on every message that asks an adviser to work through their book, so it
@@ -686,6 +691,40 @@ const DOC_LIBRARY = "Fee Calculator Data";
    it leaves room for the field names around the JSON and for a book that grows
    between one save and the next. */
 const OVERRIDES_LIMIT = 60000;
+
+/* ---------------- CSA tracker ----------------
+   The weekly "Incomplete task report" out of Xplan, and the chase that hangs
+   off it. One dump replaces the last; the library keeps the old versions, so
+   there is no history to manage here.
+
+   The chase, from a task due date D:
+     D-7   adviser alone — a first warning, which is theirs to act on
+     D     adviser + the Regional Manager
+     D+2   adviser + RM, now overdue
+     +7d   adviser + RM, every week until the task leaves the report
+
+   An agreement that has ALREADY expired copies the RM from the first message.
+   The "give them a chance" rule is for a genuine first warning; something that
+   lapsed three months ago has had its chance and nobody senior has heard. */
+const CSA_FILE = "csa/current.json";
+const CSA_DUE_SOON_DAYS = 7;
+const CSA_OVERDUE_DAYS = 2;
+const CSA_WEEKLY_DAYS = 7;
+/* How long a mark-off keeps the emails off once the dump has contradicted it.
+   One cycle: long enough that an adviser is not chased over the gap between
+   signing in Xplan and the next Monday, short enough that a tick which never
+   comes true starts chasing again by itself. */
+const CSA_DISPUTE_GRACE_DAYS = 7;
+
+/* The stages a CSA passes through, in order of severity. `cc` is whether the
+   Regional Manager is on it. Severity settles which message wins when two land
+   on the same working day — nobody gets "due today" and "overdue" together. */
+const CSA_STAGES = [
+  { id: "soon",    kind: "CSA due soon",    cc: false, roll: "back" },
+  { id: "today",   kind: "CSA due today",   cc: true,  roll: "back" },
+  { id: "overdue", kind: "CSA overdue",     cc: true,  roll: "fwd"  },
+  { id: "weekly",  kind: "CSA outstanding", cc: true,  roll: "fwd"  }
+];
 
 /* The choice values these lists carry. Declared here rather than beside the code
    that uses them because the schema audit below has to know them too. */
@@ -777,6 +816,18 @@ const EXPECTED_SCHEMA = {
     { name: "DueAt",        type: "dateTime" },
     { name: "NotifyStatus", type: "choice", choices: NOTIFY_STATUS },
     { name: "SentAt",       type: "dateTime" }
+  ]},
+  /* One row per CSA somebody has ticked off. Keyed on the Xplan thread id, so a
+     mark-off survives next week's dump landing on top of it. No client name:
+     the thread id is a reference, and the names stay in the library file. */
+  csa: { title: LIST_TITLES.csa, kind: "list", optional: true, columns: [
+    { name: "ThreadId",   type: "text" },
+    { name: "EntityId",   type: "text" },
+    { name: "Adviser",    type: "text" },
+    { name: "MarkedBy",   type: "text" },
+    { name: "MarkedAt",   type: "dateTime" },
+    { name: "DisputedAt", type: "dateTime" },
+    { name: "Note",       type: "note" }
   ]},
   advisers: { title: LIST_TITLES.advisers, kind: "list", columns: [
     { name: "AccessRole",  type: "choice", choices: ROLES },
@@ -923,11 +974,16 @@ const EMPTY_FUNDS = [];
    Anyone not in the directory gets nothing (see resolveRole), except while no
    Admin exists at all, which would otherwise lock the first person out of their
    own site. */
+/* `csa` is the tracker screen, which everyone sees — scoped to their own book,
+   their region, or everything, by csaVisible(). `csaLoad` is dropping the
+   weekly report in and chasing off the back of it, which is Advice Operations
+   and above. Marking a CSA signed needs neither: an adviser may tick their own,
+   which csaCanMark() decides. */
 const CAN = {
-  Adviser: { ownBook: true, pricing: true },
-  Ops:     { run: true, approve: true, rateCard: true, pricing: true },
-  Manager: { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true },
-  Admin:   { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true, people: true, settings: true }
+  Adviser: { ownBook: true, pricing: true, csa: true },
+  Ops:     { run: true, approve: true, rateCard: true, pricing: true, csa: true, csaLoad: true },
+  Manager: { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true, csa: true, csaLoad: true },
+  Admin:   { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true, people: true, settings: true, csa: true, csaLoad: true }
 };
 const can = what => !!(CAN[state.role] || {})[what];
 
@@ -948,6 +1004,33 @@ const SOURCE_COLUMNS = [
   { key: "value",       header: "Subfund Value" },
   { key: "currentFee",  header: "Master Client Current Ongoing Fee" }
 ];
+
+/* The columns the CSA tracker reads out of Xplan's "Incomplete task report".
+   The export also carries Task Name, Task Type and two Source Template Name
+   columns that hold the same value on every row, and a Status Comment and
+   Complete Date that are blank throughout because the report is already
+   filtered to incomplete work. None of them are read.
+
+   `status` IS read, and only to notice when it stops saying "Unactioned" —
+   that would mean the report's filter has changed and these rows are no longer
+   all outstanding, which should be said out loud rather than quietly chased. */
+const CSA_COLUMNS = [
+  { key: "entityId",   header: "Entity Id" },
+  { key: "csaEnd",     header: "CSA End Date",       date: true },
+  { key: "client",     header: "Entity Name" },
+  { key: "adviser",    header: "Secondary Adviser" },
+  { key: "activated",  header: "Task Activated Date", date: true },
+  { key: "due",        header: "Task Due Date",       date: true },
+  { key: "status",     header: "Task Status" },
+  { key: "assignee",   header: "Task Assignee" },
+  { key: "threadName", header: "Thread | Name" },
+  { key: "threadId",   header: "Task | Thread ID" }
+];
+/* The workbook ships with a second "CSA Baseline" sheet that must not be read.
+   Picking the sheet by the headers it carries rather than by position means a
+   reordered export cannot quietly feed the wrong 4,000 rows into the tracker —
+   the baseline has a client name column too, so it would not obviously fail. */
+const CSA_SHEET_SIGNATURE = ["Task | Thread ID", "Task Due Date"];
 
 /* =========================================================================
    State + persistence
@@ -997,6 +1080,15 @@ const state = {
   rcTab: "review",        // Rate/Fee Settings: "review" | "pricing"
   rcOpen: {},
   exOpen: {},
+  /* The weekly CSA report, read from the library into memory like the fee
+     extract and for the same reason — it is a list of named clients, and it has
+     no business being kept on the machine. Null until it is loaded. */
+  csa: null,
+  /* Mark-offs, keyed by Xplan thread id. This one IS a list, because it has to
+     outlive the dump it was made against. It holds no client names. */
+  csaStatus: {},
+  csaFilter: "open",      // "open" | "expired" | "marked" | "all"
+  csaOpen: {},            // which exception blocks are showing
   navCollapsed: null,     // null = follow the viewport, true/false = pinned by the user
   theme: "system",        // "system" | "light" | "dark"
   /* Set once by resolveIdentity(). Null while the app is still working out who
@@ -1317,7 +1409,8 @@ const sp = {
   adviserIds: [],         // parallel to state.advisers
   runIds: {},             // runKey -> item id
   overrideIds: {},        // runKey -> adviser -> item id
-  lastOverride: {}        // runKey -> adviser -> the JSON last written, to skip no-op writes
+  lastOverride: {},       // runKey -> adviser -> the JSON last written, to skip no-op writes
+  csaIds: {}              // Xplan thread id -> item id in the CSA list
 };
 
 const normTitle = s => String(s || "").toLowerCase().replace(/[\s_-]/g, "");
@@ -1620,6 +1713,91 @@ async function loadRun(key) {
   run.loaded = true;
 }
 
+/* ---- the CSA tracker ----
+   The dump is one file that each week's replaces. SharePoint keeps the previous
+   versions of it by itself, so there is no history to name, index or clean up
+   here — and no second copy of a list of clients to keep track of. */
+async function loadCsa() {
+  try {
+    const data = await spGetFile(CSA_FILE);
+    state.csa = (data && Array.isArray(data.rows)) ? data : null;
+  } catch (e) {
+    state.csa = null;                  // a missing or unreadable dump is an empty tracker, not a dead app
+  }
+  await loadCsaStatus();
+}
+
+async function loadCsaStatus() {
+  state.csaStatus = {};
+  sp.csaIds = {};
+  if (!sp.lists.csa) return;
+  for (const i of await spItems("csa")) {
+    const f = i.fields || {};
+    const id = String(f.ThreadId || "");
+    if (!id) continue;
+    sp.csaIds[id] = i.id;
+    state.csaStatus[id] = {
+      threadId: id, entityId: String(f.EntityId || ""), adviser: String(f.Adviser || ""),
+      markedBy: String(f.MarkedBy || ""), markedAt: f.MarkedAt || "",
+      disputedAt: f.DisputedAt || "", note: String(f.Note || "")
+    };
+  }
+}
+
+function csaStatusRow(s) {
+  return { Title: s.threadId, ThreadId: s.threadId, EntityId: s.entityId || "",
+           Adviser: s.adviser || "", MarkedBy: s.markedBy || "",
+           MarkedAt: s.markedAt || null, DisputedAt: s.disputedAt || null,
+           Note: s.note || "" };
+}
+
+async function writeCsaStatus(s) {
+  if (!sp.lists.csa) {
+    toast("The " + LIST_TITLES.csa + " list does not exist yet, so the mark-off was not saved.", "bad");
+    return false;
+  }
+  const row = csaStatusRow(s);
+  const existing = sp.csaIds[s.threadId];
+  if (existing) await spUpdate("csa", existing, row);
+  else sp.csaIds[s.threadId] = (await spCreate("csa", row)).id;
+  return true;
+}
+
+async function clearCsaStatus(threadId) {
+  const id = sp.csaIds[threadId];
+  delete state.csaStatus[threadId];
+  delete sp.csaIds[threadId];
+  if (id && sp.lists.csa) await spDelete("csa", id);
+}
+
+/* Publishing a dump is also where the platform and Xplan are reconciled.
+
+   A thread that has gone from the report has been actioned: its mark-off row is
+   deleted, which is the only tidying this list ever needs. A thread somebody
+   ticked that is STILL in the report is stamped as disputed — the tick and
+   Xplan disagree, and that has to surface rather than quietly hold the chase
+   off forever. */
+async function publishCsa(recs, fileName, counts) {
+  const payload = { takenAt: new Date().toISOString(), fileName: fileName || "",
+                    notUnactioned: counts.notUnactioned || 0, rows: recs };
+  await spPutFile(CSA_FILE, JSON.stringify(payload));
+  state.csa = payload;
+
+  const present = new Set(recs.map(r => r.threadId));
+  const now = new Date().toISOString();
+  let confirmed = 0, disputed = 0;
+  for (const id of Object.keys(state.csaStatus)) {
+    const st = state.csaStatus[id];
+    if (!present.has(id)) { await clearCsaStatus(id); confirmed++; continue; }
+    if (st.markedAt && !st.disputedAt) {
+      st.disputedAt = now;
+      await writeCsaStatus(st);
+      disputed++;
+    }
+  }
+  return { confirmed, disputed };
+}
+
 /* ---- writes ----
    Debounced and coalesced: twenty keystrokes in a row are one PATCH. The state
    is shown in the top bar and leaving with something unsaved is warned about,
@@ -1886,6 +2064,141 @@ async function notifyRunOpened(run) {
   const sent = await sendNotifications(rows);
   return { queued: sent, advisers: advisers.length, noEmail,
            alreadyHad: advisers.length - noEmail.length - (rows.length / 2) };
+}
+
+/* =========================================================================
+   CSA reminders
+   One message per adviser per working day, never two. Two tasks at different
+   stages that fall on the same day travel together under the more serious
+   heading, because "due today" and "overdue" landing in one inbox an hour apart
+   teaches people to stop reading both.
+   ========================================================================= */
+const CSA_LINK = "\n\nMark one off here: " + location.origin + location.pathname + "#csa";
+
+/* The Regional Manager comes on at the due date — except where the agreement
+   has already lapsed, which is on it from the first message. A first warning is
+   worth giving privately; something that expired in June has had that. */
+const csaWantsRm = (stage, items) =>
+  !!CSA_STAGES.find(s => s.id === stage && s.cc) || items.some(i => i.expired);
+
+function csaMessage(adviser, stage, items) {
+  const n = items.length, one = n === 1;
+  const what = n + " Client Service Agreement" + (one ? "" : "s");
+  const are = one ? " is" : " are", them = one ? "it" : "them";
+  const head = {
+    soon:    what + (one ? " falls" : " fall") + " due on " + dayLabel(items[0].due) +
+             ". Please follow " + (one ? "it" : "these") + " up and get " + them + " signed.",
+    today:   what + are + " due " + dayLabel(items[0].due) + ". This is the last working day to action " + them + ".",
+    overdue: what + are + " now overdue.",
+    weekly:  what + are + " still outstanding."
+  }[stage] || what + (one ? " needs" : " need") + " attention.";
+
+  const line = i => "  · " + i.client +
+    (i.tier ? " (" + i.tier + ")" : "") +
+    (i.expired ? " — agreement expired " + dayLabel(i.csaEnd) + ", " + i.expiredDays + " days ago"
+               : i.csaEnd ? " — agreement ends " + dayLabel(i.csaEnd) : "");
+
+  const expired = items.filter(i => i.expired);
+  const rest = items.filter(i => !i.expired);
+  let body = greeting(adviser) + head + "\n\n";
+  if (expired.length) {
+    body += "Already expired — these are running without a current agreement:\n" +
+      expired.map(line).join("\n") + "\n\n";
+  }
+  if (rest.length) body += (expired.length ? "Also outstanding:\n" : "") + rest.map(line).join("\n") + "\n";
+
+  /* Said plainly rather than "ignore this if you have done it": the report is a
+     weekly snapshot, so a CSA signed on Tuesday is still on Monday's list, and
+     an adviser needs somewhere to put that fact. */
+  body += "\nThis list is rebuilt weekly from Xplan. If " + (one ? "this" : "one of these") +
+    " has already been signed, mark it off in the Fee Hub so it stops being chased." + CSA_LINK;
+  return body;
+}
+
+/* Every message the current dump calls for over the next cycle, for everybody.
+   Grouped by adviser and by the day it would go out; the most serious stage on
+   a day names it. */
+function csaNotifications(csa, { from } = {}) {
+  const today = from || todayIso();
+  const sev = id => CSA_STAGES.findIndex(s => s.id === id);
+  const byDay = new Map();
+
+  for (const i of csa.live) {
+    if (!i.email) continue;
+    for (const s of csaSendsWithin(i.due, today, CSA_WEEKLY_DAYS)) {
+      const key = i.adviser + "|" + s.at;
+      if (!byDay.has(key)) byDay.set(key, { adviser: i.adviser, at: s.at, stage: s.stage, items: [] });
+      const g = byDay.get(key);
+      if (sev(s.stage) > sev(g.stage)) g.stage = s.stage;
+      g.items.push(i);
+    }
+  }
+
+  const rows = [];
+  for (const g of byDay.values()) {
+    const to = adviserEmail(g.adviser);
+    if (!to) continue;
+    g.items.sort((a, b) => b.expiredDays - a.expiredDays || String(a.client).localeCompare(String(b.client)));
+    const kind = (CSA_STAGES.find(s => s.id === g.stage) || {}).kind || "CSA outstanding";
+    const cc = csaWantsRm(g.stage, g.items) ? regionalManagersFor(g.adviser).map(m => m.email).join(";") : "";
+    rows.push(notifyRow({
+      /* RunKey must never look like a month. The scheduler flow cancels a
+         reminder when it finds the adviser's review Submitted under the row's
+         RunKey; under "CSA …" it finds nothing, so it always chases — which is
+         what lets the existing flow schedule these with no flow of their own.
+         A month key here would let a finished fee review cancel a CSA chase. */
+      run: "CSA " + today, adviser: g.adviser, to, cc, kind,
+      message: csaMessage(g.adviser, g.stage, g.items),
+      /* Sent on the day it is due, so it waits as Scheduled until then. Today's
+         go straight out rather than waiting a day for the scheduler. */
+      status: g.at <= today ? "Queued" : "Scheduled",
+      dueAt: csaDueAt(g.at)
+    }));
+  }
+  rows.sort((a, b) => String(a.DueAt).localeCompare(String(b.DueAt)) || String(a.Adviser).localeCompare(String(b.Adviser)));
+  return rows;
+}
+
+/* A reminder's DueAt is LOCAL midnight on the day it should go, not a UTC time.
+   The scheduler flow runs at 7am and queues anything whose DueAt has passed:
+   midnight here has passed by then, while 07:00 UTC — 6pm in Sydney — has not,
+   and would push every Friday "last working day" email into Saturday. */
+const csaDueAt = day => new Date(day + "T00:00:00").toISOString();
+/* And back again: the stored UTC instant, as the local day it stands for. A
+   plain slice of the ISO string would read the day before. */
+function localDay(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return "";
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+/* Same adviser, same kind, same day — the identity of one CSA message. */
+const csaMsgKey = (adviser, kind, dueAt) => adviser + "|" + kind + "|" + localDay(dueAt);
+
+/* Clears the way for a fresh set, in two halves.
+
+   Anything still Scheduled is cancelled: a dump landing on Monday must not
+   leave last week's unsent reminders behind it, or a CSA signed in between is
+   chased by a message written before anybody knew.
+
+   Anything already Queued or Sent is remembered and NOT written again. Without
+   that, pressing Queue twice on one morning sends every adviser today's email
+   twice — the cancel above only reaches messages that have not gone yet. */
+async function clearCsaQueue() {
+  const out = { cancelled: 0, already: new Set() };
+  if (!sp.lists.notifications) return out;
+  const kinds = new Set(CSA_STAGES.map(s => s.kind));
+  for (const i of await spItems("notifications")) {
+    const f = i.fields || {};
+    if (!kinds.has(f.Kind)) continue;
+    if (f.NotifyStatus === "Queued" || f.NotifyStatus === "Sent") {
+      out.already.add(csaMsgKey(f.Adviser, f.Kind, f.DueAt));
+    } else if (f.NotifyStatus === "Scheduled") {
+      try { await spUpdate("notifications", i.id, { NotifyStatus: "Cancelled" }); out.cancelled++; }
+      catch (e) { /* one stuck row must not stop the rest being replaced */ }
+    }
+  }
+  return out;
 }
 
 /* Says what actually happened, at length, because the failure that matters here
@@ -2479,7 +2792,11 @@ async function readZip(buffer) {
   return out;
 }
 
-function parseXlsx(text) {
+/* `wantHeaders` picks the sheet by what its header row carries. Without it the
+   first sheet in workbook order wins, which is right for the fee extract — that
+   export only ever has one sheet. The CSA workbook has two, and reading the
+   wrong one would produce four thousand plausible-looking rows. */
+function parseXlsx(text, wantHeaders) {
   const xp = new DOMParser();
 
   const sharedDoc = text["xl/sharedStrings.xml"] ? xp.parseFromString(text["xl/sharedStrings.xml"], "application/xml") : null;
@@ -2488,40 +2805,69 @@ function parseXlsx(text) {
         Array.from(si.getElementsByTagName("t")).map(t => t.textContent).join(""))
     : [];
 
-  /* Take the first sheet in workbook order — the Xplan export only ever has one. */
   const wb = xp.parseFromString(text["xl/workbook.xml"], "application/xml");
   const rels = xp.parseFromString(text["xl/_rels/workbook.xml.rels"], "application/xml");
-  const firstSheet = wb.getElementsByTagName("sheet")[0];
-  const rid = firstSheet.getAttribute("r:id") || firstSheet.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id");
-  let target = null;
-  for (const rel of Array.from(rels.getElementsByTagName("Relationship"))) {
-    if (rel.getAttribute("Id") === rid) { target = rel.getAttribute("Target"); break; }
-  }
-  const path = "xl/" + String(target || "worksheets/sheet1.xml").replace(/^\/?xl\//, "");
-  if (!text[path]) throw new Error("Could not find the worksheet inside the workbook.");
-
-  const ws = xp.parseFromString(text[path], "application/xml");
-  const grid = [];
-  for (const row of Array.from(ws.getElementsByTagName("row"))) {
-    const r = parseInt(row.getAttribute("r"), 10);
-    const cells = [];
-    for (const c of Array.from(row.getElementsByTagName("c"))) {
-      const ref = c.getAttribute("r") || "";
-      const col = colIndex(ref.replace(/\d+/g, ""));
-      const t = c.getAttribute("t");
-      let v = null;
-      if (t === "inlineStr") {
-        v = Array.from(c.getElementsByTagName("t")).map(n => n.textContent).join("");
-      } else {
-        const vn = c.getElementsByTagName("v")[0];
-        if (vn) v = (t === "s") ? (shared[parseInt(vn.textContent, 10)] || "") : vn.textContent;
-      }
-      if (v != null) cells[col] = v;
+  const relTarget = rid => {
+    for (const rel of Array.from(rels.getElementsByTagName("Relationship"))) {
+      if (rel.getAttribute("Id") === rid) return rel.getAttribute("Target");
     }
-    grid[r - 1] = cells;
+    return null;
+  };
+
+  const sheets = Array.from(wb.getElementsByTagName("sheet")).map(s => {
+    const rid = s.getAttribute("r:id") ||
+      s.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id");
+    return { name: s.getAttribute("name") || "",
+             path: "xl/" + String(relTarget(rid) || "worksheets/sheet1.xml").replace(/^\/?xl\//, "") };
+  });
+  if (!sheets.length) throw new Error("Could not find a worksheet inside the workbook.");
+
+  const gridOf = path => {
+    if (!text[path]) return null;
+    const ws = xp.parseFromString(text[path], "application/xml");
+    const grid = [];
+    for (const row of Array.from(ws.getElementsByTagName("row"))) {
+      const r = parseInt(row.getAttribute("r"), 10);
+      const cells = [];
+      for (const c of Array.from(row.getElementsByTagName("c"))) {
+        const ref = c.getAttribute("r") || "";
+        const col = colIndex(ref.replace(/\d+/g, ""));
+        const t = c.getAttribute("t");
+        let v = null;
+        if (t === "inlineStr") {
+          v = Array.from(c.getElementsByTagName("t")).map(n => n.textContent).join("");
+        } else {
+          const vn = c.getElementsByTagName("v")[0];
+          if (vn) v = (t === "s") ? (shared[parseInt(vn.textContent, 10)] || "") : vn.textContent;
+        }
+        if (v != null) cells[col] = v;
+      }
+      grid[r - 1] = cells;
+    }
+    return grid;
+  };
+
+  if (!wantHeaders || !wantHeaders.length) {
+    const grid = gridOf(sheets[0].path);
+    if (!grid) throw new Error("Could not find the worksheet inside the workbook.");
+    return grid;
   }
-  return grid;
+
+  const want = wantHeaders.map(h => squash(h));
+  for (const s of sheets) {
+    const grid = gridOf(s.path);
+    if (!grid || !grid.length) continue;
+    const head = (grid[0] || []).map(h => squash(h));
+    if (want.every(w => head.includes(w))) return grid;
+  }
+  throw new Error("No sheet in that workbook has the expected columns (" +
+    wantHeaders.join(", ") + "). Sheets found: " + sheets.map(s => s.name).join(", ") + ".");
 }
+
+/* Header matching ignores case, spaces and punctuation, because the same column
+   arrives as "Task | Thread ID", "Task Thread Id" and "task_thread_id" depending
+   on who exported it. */
+const squash = s => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]/g, "");
 
 function colIndex(letters) {
   let n = 0;
@@ -2572,6 +2918,291 @@ function gridToRecords(grid) {
   }
   if (!recs.length) throw new Error("No data rows found under the header.");
   return { recs, missing };
+}
+
+/* =========================================================================
+   CSA tracker — reading the weekly report
+   ========================================================================= */
+
+/* Excel counts days from 30 December 1899, so a date in an .xlsx arrives as
+   "46327" rather than as a date. A CSV of the same report arrives as text, and
+   Xplan writes it day-first. Both land here as plain "YYYY-MM-DD" — no Date
+   object, no timezone, nothing that can shift a due date by a day. */
+const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
+function excelDate(v) {
+  const s = String(v == null ? "" : v).trim();
+  if (!s) return "";
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Math.floor(Number(s));
+    /* 1 is 31 Dec 1899 and 80000 is well past 2100. Anything outside that is an
+       id or a quantity that happened to land in a date column. */
+    if (n < 1 || n > 80000) return "";
+    return new Date(EXCEL_EPOCH_UTC + n * 86400000).toISOString().slice(0, 10);
+  }
+  const dmy = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/);
+  if (dmy) return dmy[3] + "-" + dmy[2].padStart(2, "0") + "-" + dmy[1].padStart(2, "0");
+  const iso = s.match(/^\d{4}-\d{2}-\d{2}/);
+  return iso ? iso[0] : "";
+}
+
+/* The service tier, dug out of the thread name. That column is typed by hand
+   and arrives fifteen different ways for the same four tiers — "… 01/11/2026
+   Basic", "… - 01/11/2026 - Essential", "…- 01/01/2027- Essential ", and a
+   couple with no tier at all. Strip the title and the date and whatever is left
+   is the tier; an empty answer is honest rather than guessed. */
+function csaTier(threadName) {
+  return String(threadName || "")
+    .replace(/client\s*service\s*agreement/i, "")
+    .replace(/\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/, "")
+    .replace(/[-–—|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/* Map the report's grid onto the columns the tracker reads. Unlike the fee
+   extract there is no fall back to position: this workbook has two sheets with
+   different shapes, so a header that cannot be found by name is a reason to
+   stop rather than to guess which column it was. */
+function csaGridToRecords(grid) {
+  if (!grid || !grid.length) throw new Error("The file is empty.");
+  const header = (grid[0] || []).map(squash);
+  const idx = {}, missing = [];
+  for (const c of CSA_COLUMNS) {
+    const at = header.indexOf(squash(c.header));
+    if (at < 0) missing.push(c.header); else idx[c.key] = at;
+  }
+  if (missing.length) {
+    throw new Error("The report is missing these columns: " + missing.join(", ") +
+      ". Export the Incomplete task report again without hiding or renaming columns.");
+  }
+
+  const recs = [], seen = new Set();
+  let notUnactioned = 0, noDue = 0;
+  for (let r = 1; r < grid.length; r++) {
+    const g = grid[r];
+    if (!g) continue;
+    const rec = {};
+    for (const c of CSA_COLUMNS) {
+      const raw = g[idx[c.key]];
+      rec[c.key] = c.date ? excelDate(raw) : String(raw == null ? "" : raw).trim();
+    }
+    if (!rec.threadId && !rec.entityId) continue;
+    /* The report is filtered to incomplete work, so every row should read
+       "Unactioned". If that ever changes the filter has changed with it, and
+       these are no longer all outstanding — counted here and said on the import
+       dialog rather than chased regardless. */
+    if (rec.status && !/^unactioned$/i.test(rec.status)) notUnactioned++;
+    if (!rec.due) noDue++;
+    /* The thread id is what a mark-off is keyed on, so two rows sharing one
+       would let a tick silence the wrong CSA. */
+    const key = rec.threadId || "e:" + rec.entityId;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rec.tier = csaTier(rec.threadName);
+    /* The report says "CSA, North"; the directory says "Northern". Named the
+       directory's way so one screen does not show both words for one region.
+       Only ever shown — the Regional Manager is found through the adviser's own
+       row, not through this. */
+    rec.region = /south/i.test(rec.assignee) ? "Southern"
+               : /north/i.test(rec.assignee) ? "Northern" : "";
+    recs.push(rec);
+  }
+  if (!recs.length) throw new Error("No data rows found under the header.");
+  return { recs, notUnactioned, noDue };
+}
+
+/* ---------------- dates, as plain YYYY-MM-DD ----------------
+   Everything here stays a string. A Date object picks up a timezone, and an
+   adviser in Sydney opening this at 9am would otherwise be told a CSA is due
+   "tomorrow" because UTC is still on yesterday. */
+function todayIso() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
+    "-" + String(d.getDate()).padStart(2, "0");
+}
+function addDays(iso, n) {
+  const p = String(iso).split("-").map(Number);
+  return new Date(Date.UTC(p[0], p[1] - 1, p[2] + n)).toISOString().slice(0, 10);
+}
+function daysBetween(a, b) {
+  const x = String(a).split("-").map(Number), y = String(b).split("-").map(Number);
+  return Math.round((Date.UTC(y[0], y[1] - 1, y[2]) - Date.UTC(x[0], x[1] - 1, x[2])) / 86400000);
+}
+const dayLabel = iso => iso
+  ? new Date(iso + "T00:00:00Z").toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" })
+  : "—";
+
+/* Weekends, and the national holidays that fall on the same date every year.
+   CSAs are due on the 1st, so 1 January is a due date every year and Christmas
+   Day is its seven-day warning — without these, the January batch is chased on
+   both. Easter, the King's Birthday and Labour Day move and differ by state, and
+   are not here; a CSA reminder landing on one of those is the price of not
+   maintaining a calendar. */
+const FIXED_HOLIDAYS = ["01-01", "01-26", "04-25", "12-25", "12-26"];
+const isWeekend = iso => { const d = new Date(iso + "T00:00:00Z").getUTCDay(); return d === 0 || d === 6; };
+const isNonWorking = iso => isWeekend(iso) || FIXED_HOLIDAYS.includes(String(iso).slice(5));
+function rollBusiness(iso, dir) {
+  let d = iso;
+  for (let i = 0; i < 10 && isNonWorking(d); i++) d = addDays(d, dir === "back" ? -1 : 1);
+  return d;
+}
+
+/* When each message for one task would go out.
+
+   The two before the deadline roll BACKWARDS to the last working day: a warning
+   that arrives after the date it was warning about is no warning. The overdue
+   ones roll forwards. 1 November 2026 is a Sunday and so is the 25th, so the
+   very first batch needs this in both directions. */
+function csaPlan(due) {
+  if (!due) return [];
+  return [
+    { stage: "soon",    at: rollBusiness(addDays(due, -CSA_DUE_SOON_DAYS), "back") },
+    { stage: "today",   at: rollBusiness(due, "back") },
+    { stage: "overdue", at: rollBusiness(addDays(due, CSA_OVERDUE_DAYS), "fwd") }
+  ];
+}
+
+/* Every message for one task that falls in [from, from + days). Queueing writes
+   a week at a time — one full cycle of the weekly report — so a reminder due
+   on Friday exists from Monday onward rather than only if somebody happens to
+   queue again before Friday. Past the overdue one it repeats weekly, anchored
+   on the true date rather than on the last rolled one, so a run of weekends
+   cannot walk the reminder down the calendar. */
+function csaSendsWithin(due, from, days) {
+  if (!due) return [];
+  const until = addDays(from, days);
+  const out = csaPlan(due).filter(p => p.at >= from && p.at < until);
+  const base = addDays(due, CSA_OVERDUE_DAYS);
+  for (let n = 1; n <= 260; n++) {
+    const at = rollBusiness(addDays(base, n * CSA_WEEKLY_DAYS), "fwd");
+    if (at >= until) break;
+    if (at >= from) out.push({ stage: "weekly", at });
+  }
+  return out;
+}
+
+/* Where a task sits today, for the screen rather than for the mail. */
+function csaStage(due, today) {
+  if (!due) return "unknown";
+  const p = csaPlan(due);
+  if (today < p[0].at) return "upcoming";
+  if (today < p[1].at) return "soon";
+  if (today < p[2].at) return "due";
+  return "overdue";
+}
+const CSA_STAGE_LABEL = { upcoming: "Not yet due", soon: "Due soon", due: "Due now",
+                          overdue: "Overdue", unknown: "No due date" };
+
+/* A ticked CSA stops being chased. If next week's dump still carries it, the
+   tick and the report disagree: it comes back flagged, and the chase resumes
+   one cycle later rather than immediately, so nobody is chased over the gap
+   between signing in Xplan and the next dump. */
+function csaSuppressed(st, today) {
+  if (!st || !st.markedAt) return false;
+  if (!st.disputedAt) return true;
+  return daysBetween(st.disputedAt.slice(0, 10), today) < CSA_DISPUTE_GRACE_DAYS;
+}
+
+/* =========================================================================
+   CSA tracker — the engine
+   Joins the weekly report to the current fee run for the two fee figures, works
+   out how aged each one is, and sorts the exceptions out from the chase.
+   ========================================================================= */
+function buildCsa() {
+  const dump = state.csa;
+  if (!dump || !Array.isArray(dump.rows) || !dump.rows.length) return null;
+  const today = todayIso();
+
+  /* The fee run is where both money columns come from. Without one loaded the
+     tracker still works — it just cannot price anything, which it says rather
+     than showing zeroes. */
+  const masters = new Map();
+  if (state.calc) for (const m of state.calc.masters) masters.set(String(m.masterId), m);
+  const inDirectory = new Set(state.advisers.filter(a => a.active !== false).map(a => a.name));
+
+  const items = dump.rows.map(r => {
+    const master = masters.get(String(r.entityId)) || null;
+    /* Route off the fee run: it is a fresh monthly snapshot of who owns the
+       book, while the task carries whoever was on it when it was raised — and
+       most of these were raised months ago. With no master to go on, the task's
+       adviser is all there is. */
+    const owner = (master && master.adviser) || r.adviser;
+    const st = state.csaStatus[r.threadId] || null;
+    const expiredDays = r.csaEnd ? Math.max(0, daysBetween(r.csaEnd, today)) : 0;
+    return {
+      ...r,
+      master, adviser: owner, taskAdviser: r.adviser,
+      currentFee: master ? master.currentFee : null,
+      calcFee: master && master.fee != null ? master.fee : null,
+      category: master ? master.category : "",
+      mismatch: !!(master && master.adviser && r.adviser && master.adviser !== r.adviser),
+      knownAdviser: inDirectory.has(owner),
+      email: adviserEmail(owner),
+      expiredDays, expired: expiredDays > 0,
+      daysToDue: r.due ? daysBetween(today, r.due) : null,
+      stage: csaStage(r.due, today),
+      marked: st, suppressed: csaSuppressed(st, today)
+    };
+  });
+
+  /* Worst first. Something that lapsed in June matters more than something due
+     next month, and sorting by due date alone buries it. */
+  items.sort((a, b) =>
+    b.expiredDays - a.expiredDays ||
+    String(a.due || "9999").localeCompare(String(b.due || "9999")) ||
+    String(a.client).localeCompare(String(b.client)));
+
+  const live = items.filter(i => !i.suppressed);
+  const sum = (list, f) => list.reduce((a, i) => a + (f(i) || 0), 0);
+  return {
+    takenAt: dump.takenAt || "", fileName: dump.fileName || "",
+    notUnactioned: dump.notUnactioned || 0,
+    items, live,
+    marked: items.filter(i => i.marked),
+    disputed: items.filter(i => i.marked && i.marked.disputedAt),
+    expired: live.filter(i => i.expired),
+    /* By stage rather than by counting days, so the card and the emails agree:
+       the first reminder rolls back to a Friday, and a CSA nine days out on a
+       Sunday deadline is already "due soon" in the inbox. */
+    dueSoon: live.filter(i => i.stage === "soon" || i.stage === "due"),
+    atRisk: sum(live, i => i.currentFee),
+    calcTotal: sum(live, i => i.calcFee),
+    priced: live.filter(i => i.currentFee != null).length,
+    /* Four ways the report and the platform can disagree. Each one is a reason
+       a chase would go to the wrong person or carry the wrong number, so none
+       of them is allowed to pass quietly. */
+    /* Only meaningful with a run to match against. Without one, every row would
+       land here, and the banner at the top already says why. */
+    exNoMaster:  state.calc ? items.filter(i => !i.master) : [],
+    exMismatch:  items.filter(i => i.mismatch),
+    exNoAdviser: items.filter(i => !i.knownAdviser || !i.email),
+    exNoTier:    items.filter(i => !i.tier),
+    exNoDue:     items.filter(i => !i.due)
+  };
+}
+
+/* What the signed-in person is allowed to see. An adviser gets their own, a
+   Manager their region, Advice Operations and Admin the lot. */
+function csaVisible(list) {
+  if (can("ownBook")) {
+    const me = state.asAdviser;
+    return list.filter(i => i.adviser === me || i.taskAdviser === me);
+  }
+  if (state.role === "Manager") {
+    const mine = new Set(state.advisers
+      .filter(a => myRegionCovers(a.region)).map(a => a.name));
+    return list.filter(i => mine.has(i.adviser) || mine.has(i.taskAdviser));
+  }
+  return list;
+}
+
+/* A Manager's own region, from their directory row. REGION_ALL covers every
+   adviser — the same rule regionalManagersFor() applies in the other direction. */
+function myRegionCovers(region) {
+  const me = state.identity && adviserRow(state.identity.name);
+  const mine = me && me.region;
+  if (!mine || mine === REGION_NONE) return false;
+  return mine === REGION_ALL || region === mine || region === REGION_ALL;
 }
 
 /* =========================================================================
@@ -3281,6 +3912,8 @@ const ICONS = {
   approvals:  '<path d="M5 12.5 9.5 17 19 7"/>',
   ratecard:   '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 14h4"/>',
   pricing:    '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2m3 0h3M8 15h2m3 0h3"/>',
+  csa:        '<path d="M8 3h8a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/>' +
+              '<path d="M9.5 8h5M9.5 12h5"/><path d="M9.5 16l1.5 1.5 3-3"/>',
   /* Keyed by view id — this was still "advisers" after the screen became
      "people", so the rail was drawing an empty svg. */
   people:     '<circle cx="9.5" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.9-5.5 6.5-5.5S16 15.7 16 19"/>' +
@@ -3299,6 +3932,10 @@ const VIEWS = [
   { id: "approvals", label: "Approvals",  section: "Run",    needs: "approve" },
   /* Everyone gets this one, advisers included — it prices a new or existing
      client and has nothing to do with whose book a run belongs to. */
+  /* Its own section: it is not scoped to a run, and burying it under "Run"
+     would imply a month it has nothing to do with. */
+  { id: "csa",       label: "CSA Tracker", section: "CSA", needs: "csa",
+    adviserSection: "CSA" },
   { id: "pricing",   label: "Pricing Calculator", section: "Tools", needs: "pricing",
     adviserSection: "Tools" },
   { id: "ratecard",  label: "Rate/Fee Settings", section: "Admin", needs: "rateCard" },
@@ -3408,9 +4045,15 @@ async function startSession() {
     await loadReference();
     await loadRunIndex();
     if (state.runKey) await loadRun(state.runKey);
+    /* Last, and swallowing its own failures: the CSA tracker is a screen, not a
+       dependency, and a site without its list yet must still open. */
+    await loadCsa();
 
     state.authState = "ready";
     saveUi();
+    /* A reminder email links straight to the tracker, so honour the fragment it
+       arrives with rather than dropping the adviser on the dashboard. */
+    if (location.hash === "#csa" && visibleViews().some(v => v.id === "csa")) state.view = "csa";
     render();
     if (id.bootstrap) {
       toast("No Admin in the directory yet, so you are one. Add a real Admin row to close this.", "bad");
@@ -3512,7 +4155,7 @@ function render() {
   const run = currentRun();
   const titles = {
     run: "Run/Dashboard", review: "Review", exceptions: "Exceptions",
-    approvals: "Approvals", pricing: "Pricing Calculator",
+    approvals: "Approvals", pricing: "Pricing Calculator", csa: "CSA Tracker",
     ratecard: "Rate/Fee Settings", people: "People", settings: "Settings"
   };
   $("#pgTitle").textContent = (adviserMode && state.view === "review") ? "My Clients" : (titles[state.view] || "Run/Dashboard");
@@ -3521,6 +4164,13 @@ function render() {
   $("#pgSub").innerHTML = state.view === "pricing"
     ? (pricing().reviewed ? "Pricing last reviewed " + esc(pricing().reviewed) : "Internal pricing") +
       " &middot; all fees include GST"
+    /* The tracker runs on its own weekly report, so the subtitle says when that
+       was taken rather than which fee month happens to be open. */
+    : state.view === "csa"
+    ? (state.csa && state.csa.takenAt
+        ? "Report loaded " + esc(dayLabel(state.csa.takenAt.slice(0, 10))) +
+          " &middot; " + (state.csa.rows || []).length + " outstanding"
+        : "No report loaded")
     : run
     ? monthLabel(run.key) + ' &middot; <span class="pill ' + statusPill(run.status) + '">' +
       esc(adviserMode ? adviserState(state.asAdviser).status : run.status) + "</span>" +
@@ -3541,8 +4191,8 @@ function render() {
   paintSaveState();
 
   const fn = { run: viewRun, review: viewReview, exceptions: viewExceptions,
-               approvals: viewApprovals, pricing: viewPricing, ratecard: viewRateCard,
-               people: viewPeople, settings: viewSettings }[state.view];
+               approvals: viewApprovals, pricing: viewPricing, csa: viewCsa,
+               ratecard: viewRateCard, people: viewPeople, settings: viewSettings }[state.view];
   /* The one state where somebody holds more authority than the directory gave
      them, said out loud on every screen until it is closed. */
   const bootstrapping = state.identity && state.identity.bootstrap;
@@ -3590,7 +4240,9 @@ function renderTopActions() {
       keys.map(k => '<option value="' + k + '"' + (k === state.runKey ? " selected" : "") + ">" + esc(monthLabel(k)) + "</option>").join("") +
       "</select>";
   }
-  if (run && can("approve")) {
+  /* On the CSA tracker the month picker stays — it chooses which run prices the
+     CSAs — but opening or locking a fee run from there would be a surprise. */
+  if (run && can("approve") && state.view !== "csa") {
     if (run.status === "Draft") html += '<button class="btn sky" id="btnOpen">Open for review</button>';
     if (run.status === "Open for Review") html += '<button class="btn" id="btnLock">Lock run</button>';
     if (run.status === "Locked") html += '<button class="btn ghost" id="btnUnlock">Reopen</button>';
@@ -4772,6 +5424,232 @@ function ancCard(a) {
 
 const pricingTabBtn = (id, label) =>
   '<button class="btn' + (pricingInputs.tab === id ? "" : " ghost") + '" data-ptab="' + id + '">' + esc(label) + "</button>";
+
+/* =========================================================================
+   CSA Tracker
+   The weekly Incomplete task report, with the two fee figures joined on from
+   the current run, the ageing worked out, and a way to take one off the chase.
+   ========================================================================= */
+
+/* An adviser may tick off their own; Advice Operations and above, anybody's. */
+const csaCanMark = i => can("csaLoad") ||
+  (can("ownBook") && (i.adviser === state.asAdviser || i.taskAdviser === state.asAdviser));
+
+const CSA_FILTERS = [
+  { id: "open",    label: "Being chased" },
+  { id: "expired", label: "Already expired" },
+  { id: "marked",  label: "Marked off" },
+  { id: "all",     label: "Everything" }
+];
+
+function csaFiltered(csa, list) {
+  switch (state.csaFilter) {
+    case "expired": return list.filter(i => i.expired && !i.suppressed);
+    case "marked":  return list.filter(i => i.marked);
+    case "all":     return list;
+    default:        return list.filter(i => !i.suppressed);
+  }
+}
+
+function csaRow(i) {
+  const stage = '<span class="pill ' +
+    ({ overdue: "bad", due: "warn", soon: "info", upcoming: "", unknown: "warn" }[i.stage] || "") +
+    '">' + esc(CSA_STAGE_LABEL[i.stage]) + "</span>";
+  const aged = i.expired
+    ? '<span class="pill bad">' + i.expiredDays + " day" + (i.expiredDays === 1 ? "" : "s") + "</span>"
+    : i.csaEnd ? '<span class="small muted">ends ' + esc(dayLabel(i.csaEnd)) + "</span>"
+    : '<span class="small muted">&mdash;</span>';
+
+  /* Two notes that change who should act, so they sit on the row rather than
+     only in the exceptions block further down. */
+  const flags =
+    (i.mismatch ? '<span class="pill warn" title="The fee run says ' + esc(i.adviser) +
+      '; the Xplan task says ' + esc(i.taskAdviser) + '">adviser differs</span> ' : "") +
+    (!i.master ? '<span class="pill warn" title="No matching client in the current fee run">not in run</span> ' : "") +
+    (i.marked && i.marked.disputedAt
+      ? '<span class="pill bad" title="Marked signed on ' + esc(dayLabel(i.marked.markedAt.slice(0, 10))) +
+        ' but still on the report">still showing</span> '
+      : i.marked ? '<span class="pill good">marked off</span> ' : "");
+
+  return "<tr" + (i.suppressed ? ' class="muted"' : "") + "><td>" + esc(i.client) +
+    (i.tier ? ' <span class="small muted">' + esc(i.tier) + "</span>" : "") +
+    (flags ? "<br>" + flags : "") + "</td>" +
+    "<td>" + esc(i.adviser || "—") + "</td>" +
+    "<td>" + aged + "</td>" +
+    "<td>" + esc(dayLabel(i.due)) + "<br>" + stage + "</td>" +
+    '<td class="num">' + money(i.currentFee) + "</td>" +
+    '<td class="num">' + money(i.calcFee) + "</td>" +
+    '<td class="no-print">' + (csaCanMark(i)
+      ? (i.marked
+          ? '<button class="btn ghost btn-sm" data-csaundo="' + esc(i.threadId) + '">Undo</button>'
+          : '<button class="btn ghost btn-sm" data-csamark="' + esc(i.threadId) + '">Mark signed</button>')
+      : "") + "</td></tr>";
+}
+
+function csaExceptionBlocks(csa) {
+  const blocks = [
+    { key: "mismatch", title: "Adviser differs between the run and the task",
+      list: csa.exMismatch,
+      why: "The fee run and the Xplan task name different advisers. The chase goes to the one on the " +
+           "<strong>fee run</strong> &mdash; it is a fresh monthly snapshot, while a task carries whoever was on it " +
+           "when it was raised, and most of these were raised months ago. Worth correcting in Xplan either way.",
+      cols: ["Client", "Fee run says", "Task says"],
+      row: i => "<tr><td>" + esc(i.client) + "</td><td>" + esc(i.adviser) + "</td><td>" + esc(i.taskAdviser) + "</td></tr>" },
+    { key: "nomaster", title: "No matching client in the fee run",
+      list: csa.exNoMaster,
+      why: "Nothing in the current run carries this Xplan id, so neither fee figure can be shown. " +
+           "Usually a client who joined after the extract was taken &mdash; but if <em>every</em> row is here, " +
+           "the two reports are not using the same id and nothing on this screen should be trusted.",
+      cols: ["Client", "Xplan id", "Adviser"],
+      row: i => "<tr><td>" + esc(i.client) + '</td><td class="mono">' + esc(i.entityId) + "</td><td>" + esc(i.adviser) + "</td></tr>" },
+    { key: "noadviser", title: "Nobody to email",
+      list: csa.exNoAdviser,
+      why: "The adviser is not in <code>" + esc(LIST_TITLES.advisers) + "</code>, or has no email address there. " +
+           "No reminder can be sent for these, so they are chased by nobody until the directory is fixed.",
+      cols: ["Client", "Adviser", "In the directory"],
+      row: i => "<tr><td>" + esc(i.client) + "</td><td>" + esc(i.adviser || "—") + "</td><td>" +
+                (i.knownAdviser ? "yes, but no email address" : "no") + "</td></tr>" },
+    { key: "notier", title: "Tier could not be read",
+      list: csa.exNoTier,
+      why: "The tier is typed by hand into the thread name and these rows have none. Cosmetic &mdash; " +
+           "the chase and both fee figures are unaffected.",
+      cols: ["Client", "Thread name"],
+      row: i => "<tr><td>" + esc(i.client) + "</td><td>" + esc(i.threadName || "—") + "</td></tr>" },
+    { key: "nodue", title: "No due date",
+      list: csa.exNoDue,
+      why: "Without a due date there is no schedule to put them on, so they are listed here and never emailed.",
+      cols: ["Client", "Adviser"],
+      row: i => "<tr><td>" + esc(i.client) + "</td><td>" + esc(i.adviser) + "</td></tr>" }
+  ].filter(b => b.list.length);
+
+  if (!blocks.length) {
+    return '<div class="banner good">Every row matched a client in the fee run, an adviser in the directory ' +
+      "and a due date. Nothing needs a look.</div>";
+  }
+  return blocks.map(b => foldShell({
+    id: "csx-" + b.key, attr: "data-csafold", key: b.key,
+    title: b.title, sub: "",
+    /* Open on arrival: a folded exception is an exception nobody reads, and the
+       whole point of this block is that somebody notices. */
+    open: state.csaOpen[b.key] === undefined ? true : !!state.csaOpen[b.key],
+    badge: '<span class="pill warn">' + b.list.length + "</span>",
+    body: () => '<div class="small muted" style="margin-bottom:12px">' + b.why + "</div>" +
+      '<div class="tbl-scroll"><table><thead><tr>' + b.cols.map(c => "<th>" + esc(c) + "</th>").join("") +
+      "</tr></thead><tbody>" + b.list.map(b.row).join("") + "</tbody></table></div>"
+  })).join("");
+}
+
+function viewCsa() {
+  const csa = buildCsa();
+
+  const dropZone = can("csaLoad")
+    ? '<div class="card"><div class="card-h"><h2>Weekly report</h2>' +
+      '<div class="sub">Xplan &rarr; Incomplete task report</div></div>' +
+      '<div class="card-b"><div class="drop" id="csaDrop"><h3>Drop the report here</h3>' +
+      "<p>or click to choose a file &mdash; the sheet is picked by its columns, so the " +
+      "<em>CSA Baseline</em> tab is ignored</p></div>" +
+      '<input type="file" id="csaFile" accept=".xlsx,.csv" class="hide"></div></div>' +
+      '<div class="spacer"></div>'
+    : "";
+
+  if (!csa) {
+    return dropZone + '<div class="banner warn"><strong>No CSA report loaded yet.</strong> ' +
+      (can("csaLoad")
+        ? "Drop the weekly <em>Incomplete task report</em> above and the tracker fills in."
+        : "Advice Operations load this each week.") + "</div>";
+  }
+
+  const mine = csaVisible(csa.items);
+  const liveMine = mine.filter(i => !i.suppressed);
+  const expiredMine = liveMine.filter(i => i.expired);
+  const soonMine = liveMine.filter(i => i.stage === "soon" || i.stage === "due");
+  const pricedMine = liveMine.filter(i => i.currentFee != null);
+  /* Null rather than zero when nothing could be priced — "$0 at risk" reads as
+     good news, and it is the opposite of what an unpriced list means. */
+  const atRisk = pricedMine.length ? pricedMine.reduce((a, i) => a + i.currentFee, 0) : null;
+  const unpriced = liveMine.length - pricedMine.length;
+
+  let html = "";
+
+  if (!state.calc) {
+    html += '<div class="banner warn"><strong>No fee run is loaded</strong>, so neither fee column can be ' +
+      "filled in. The chase still works &mdash; open a month on Run/Dashboard to price these.</div>";
+  }
+  if (csa.notUnactioned) {
+    html += '<div class="banner bad"><strong>' + csa.notUnactioned + " row" +
+      (csa.notUnactioned === 1 ? " is" : "s are") + " not marked <em>Unactioned</em>.</strong> " +
+      "This report is meant to be filtered to incomplete work, so its filter has changed. " +
+      "Check the export before trusting what is below.</div>";
+  }
+  if (can("csaLoad") && state.csa && !state.csa.queuedAt) {
+    html += '<div class="banner warn"><strong>No reminders have been queued from this report.</strong> ' +
+      "Loading it does not chase anybody by itself &mdash; press <strong>Queue reminders</strong> below once " +
+      "you have checked the list.</div>";
+  }
+  if (csa.disputed.length && can("csaLoad")) {
+    html += '<div class="banner warn"><strong>' + csa.disputed.length + " marked off but still on the report.</strong> " +
+      "Either they were ticked before Xplan caught up, or the signing did not save. They are not being " +
+      "chased for another " + CSA_DISPUTE_GRACE_DAYS + " days, then they go back on the list.</div>";
+  }
+
+  html += '<div class="stats">' +
+    stat("Outstanding", String(liveMine.length), csa.takenAt ? "as at " + dayLabel(csa.takenAt.slice(0, 10)) : "") +
+    stat("Value at risk", money(atRisk),
+         unpriced ? unpriced + " not priced" : "current ongoing fees") +
+    stat("Already expired", String(expiredMine.length),
+         expiredMine.length ? "oldest " + expiredMine[0].expiredDays + " days" : "none", expiredMine.length ? "bad" : "") +
+    stat("Due soon", String(soonMine.length),
+         soonMine.length ? "earliest " + dayLabel(soonMine.map(i => i.due).sort()[0]) : "none in the reminder window") +
+    "</div><div class=\"spacer\"></div>";
+
+  html += dropZone;
+
+  /* Chasing is Advice Operations' button, not an adviser's. */
+  if (can("csaLoad")) {
+    /* The preview is scoped like the table — a Manager sees their own region's
+       messages. Queueing still writes everybody's: it is one weekly operation,
+       and whichever of Advice Operations or a Manager presses it, the same
+       messages go out. */
+    const pend = csaNotifications({ ...csa, live: csaVisible(csa.live) });
+    html += '<div class="card"><div class="card-h"><h2>Reminders</h2>' +
+      '<div class="sub">What the current report calls for over the next ' + CSA_WEEKLY_DAYS + " days</div>" +
+      '<div class="right no-print"><button class="btn" id="btnCsaQueue">Queue reminders</button></div></div>' +
+      '<div class="card-b">' +
+      (pend.length
+        ? '<div class="tbl-scroll"><table><thead><tr><th>Sends</th><th>Kind</th><th>Adviser</th>' +
+          "<th>Also to</th></tr></thead><tbody>" +
+          pend.map(r => "<tr><td>" + esc(dayLabel(localDay(r.DueAt))) + "</td><td>" + esc(r.Kind) +
+            "</td><td>" + esc(r.Adviser) + "</td><td>" +
+            (r.CcEmail ? esc(r.CcEmail.split(";").join(", ")) : '<span class="muted">adviser only</span>') +
+            "</td></tr>").join("") + "</tbody></table></div>"
+        : '<div class="muted">Nothing to send &mdash; every outstanding CSA is either marked off or has nobody to email.</div>') +
+      '<div class="spacer"></div><div class="small muted">Queueing replaces anything still waiting to go out, ' +
+      "so a CSA signed since the last dump is not chased by a message written before anybody knew. " +
+      "One message per adviser per day at most: two stages landing together travel under the more serious one.</div>" +
+      "</div></div><div class=\"spacer\"></div>";
+  }
+
+  const rows = csaFiltered(csa, mine);
+  html += '<div class="toggle-row no-print" style="margin-bottom:12px"><span class="seg">' +
+    CSA_FILTERS.map(f => '<button class="' + (state.csaFilter === f.id ? "on" : "") + '" data-csafilter="' + f.id +
+      '" aria-pressed="' + (state.csaFilter === f.id) + '">' + esc(f.label) + "</button>").join("") +
+    '</span><span class="small muted">' + rows.length + " of " + mine.length + " shown</span></div>";
+
+  html += '<div class="card"><div class="card-b">' +
+    (rows.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Client</th><th>Adviser</th><th>Agreement</th>' +
+        '<th>Task due</th><th class="num">Current fee</th><th class="num">Calculated</th>' +
+        '<th class="no-print"></th></tr></thead><tbody>' +
+        rows.map(csaRow).join("") + "</tbody></table></div>"
+      : '<div class="muted">Nothing here.</div>') +
+    '<div class="spacer"></div><div class="small muted"><strong>Current fee</strong> is what the client pays ' +
+    "today &mdash; what is at risk while the agreement is unsigned. <strong>Calculated</strong> is what this " +
+    "month's rate card makes it. Both come from the fee run; a dash means that client is not in it." +
+    "</div></div></div><div class=\"spacer\"></div>";
+
+  html += '<h2 style="font-size:1rem;margin:0 0 12px">Needs a look</h2>' + csaExceptionBlocks(csa);
+  return html;
+}
 
 function viewPricing() {
   const p = pricing();
@@ -6034,6 +6912,29 @@ function wire() {
     fileInput.addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
   }
 
+  /* --- CSA tracker --- */
+  const csaDrop = $("#csaDrop"), csaFile = $("#csaFile");
+  if (csaDrop) {
+    csaDrop.addEventListener("click", () => csaFile.click());
+    csaDrop.addEventListener("dragover", e => { e.preventDefault(); csaDrop.classList.add("over"); });
+    csaDrop.addEventListener("dragleave", () => csaDrop.classList.remove("over"));
+    csaDrop.addEventListener("drop", e => {
+      e.preventDefault(); csaDrop.classList.remove("over");
+      if (e.dataTransfer.files[0]) loadCsaFile(e.dataTransfer.files[0]);
+    });
+    csaFile.addEventListener("change", e => { if (e.target.files[0]) loadCsaFile(e.target.files[0]); });
+  }
+
+  document.querySelectorAll("[data-csafilter]").forEach(el =>
+    el.addEventListener("click", () => { state.csaFilter = el.dataset.csafilter; render(); }));
+
+  document.querySelectorAll("[data-csamark]").forEach(el =>
+    el.addEventListener("click", () => markCsaSigned(el.dataset.csamark)));
+  document.querySelectorAll("[data-csaundo]").forEach(el =>
+    el.addEventListener("click", () => undoCsaSigned(el.dataset.csaundo)));
+
+  if ($("#btnCsaQueue")) $("#btnCsaQueue").addEventListener("click", queueCsaReminders);
+
   /* --- review edits --- */
   document.querySelectorAll("[data-mo]").forEach(el => {
     el.addEventListener("change", () => {
@@ -6412,6 +7313,9 @@ function wire() {
   };
   foldWire("data-rcfold", "data-rcjump", state.rcOpen);
   foldWire("data-exfold", "data-exjump", state.exOpen);
+  /* The CSA exception blocks have no jump tiles — there are at most five of
+     them and they are already at the bottom of their own screen. */
+  foldWire("data-csafold", "data-csanojump", state.csaOpen);
 
   document.querySelectorAll("[data-rctab]").forEach(el =>
     el.addEventListener("click", () => { state.rcTab = el.dataset.rctab; render(); }));
@@ -6622,6 +7526,151 @@ async function loadFile(file) {
   } catch (e) {
     toast(e.message || "Could not read that file.", "bad");
   }
+}
+
+/* =========================================================================
+   CSA tracker — loading the weekly report and acting on it
+   ========================================================================= */
+async function loadCsaFile(file) {
+  try {
+    toast("Reading " + file.name + "…");
+    let grid;
+    if (/\.csv$/i.test(file.name)) grid = parseCsv(await file.text());
+    else grid = parseXlsx(await readZip(await file.arrayBuffer()), CSA_SHEET_SIGNATURE);
+    const { recs, notUnactioned, noDue } = csaGridToRecords(grid);
+    openCsaImportDialog(file.name, recs, notUnactioned, noDue);
+  } catch (e) {
+    toast(e.message || "Could not read that file.", "bad");
+  }
+}
+
+function openCsaImportDialog(fileName, recs, notUnactioned, noDue) {
+  const today = todayIso();
+  const advisers = new Set(recs.map(r => r.adviser).filter(Boolean));
+  const expired = recs.filter(r => r.csaEnd && daysBetween(r.csaEnd, today) > 0);
+  const dues = [...new Set(recs.map(r => r.due).filter(Boolean))].sort();
+  const noTier = recs.filter(r => !r.tier).length;
+
+  /* Said before it is loaded rather than after, because the join is the one
+     thing that cannot be checked from the report alone — and all-or-nothing is
+     the shape a wrong id would take. */
+  let joined = null;
+  if (state.calc) {
+    const ids = new Set(state.calc.masters.map(m => String(m.masterId)));
+    joined = recs.filter(r => ids.has(String(r.entityId))).length;
+  }
+
+  const body =
+    '<div class="kv" style="margin-bottom:16px">' +
+    '<div class="k">File</div><div class="v">' + esc(fileName) + "</div>" +
+    '<div class="k">Outstanding CSAs</div><div class="v">' + recs.length + "</div>" +
+    '<div class="k">Advisers</div><div class="v">' + advisers.size + "</div>" +
+    '<div class="k">Already expired</div><div class="v">' + expired.length + "</div>" +
+    '<div class="k">Due dates</div><div class="v">' +
+      (dues.length ? dues.map(dayLabel).join(", ") : "none") + "</div>" +
+    (joined === null
+      ? '<div class="k">Matched to the fee run</div><div class="v">no run loaded</div>'
+      : '<div class="k">Matched to the fee run</div><div class="v">' + joined + " of " + recs.length + "</div>") +
+    "</div>" +
+    (notUnactioned
+      ? '<div class="banner bad">' + notUnactioned + " row" + (notUnactioned === 1 ? "" : "s") +
+        " not marked <strong>Unactioned</strong>. This report is meant to be filtered to incomplete work.</div>"
+      : "") +
+    (noDue ? '<div class="banner warn">' + noDue + " row" + (noDue === 1 ? " has" : "s have") +
+      " no due date, so " + (noDue === 1 ? "it" : "they") + " cannot be scheduled.</div>" : "") +
+    (joined === 0 && recs.length
+      ? '<div class="banner bad"><strong>Nothing matched the fee run.</strong> The two reports are not using ' +
+        "the same client id, so neither fee column will fill in. Load it if you want the chase, but the " +
+        "money on this screen will be blank.</div>"
+      : joined !== null && joined < recs.length
+      ? '<div class="banner warn">' + (recs.length - joined) + " will show no fee &mdash; " +
+        "no client with that id is in the loaded run.</div>"
+      : "") +
+    (noTier ? '<div class="small muted">' + noTier + " row" + (noTier === 1 ? "" : "s") +
+      " had no tier in the thread name. Cosmetic only.</div>" : "");
+
+  showDialog("Load CSA report", body, "Load report", async () => {
+    try {
+      const res = await publishCsa(recs, fileName, { notUnactioned });
+      let msg = recs.length + " outstanding CSAs loaded.";
+      if (res.confirmed) msg += " " + res.confirmed + " previously marked off have cleared.";
+      if (res.disputed) msg += " " + res.disputed + " marked off are still on the report.";
+      toast(msg, "good");
+      render();
+    } catch (e) {
+      toast("Could not save the report. " + ((e && e.message) || e), "bad");
+    }
+  });
+}
+
+/* Marking one off asks for a reason the way removing a client from a review
+   does — a tick with no note tells the next person nothing. */
+function markCsaSigned(threadId) {
+  const csa = buildCsa();
+  const item = csa && csa.items.find(i => i.threadId === threadId);
+  if (!item) return;
+  showDialog("Mark as signed",
+    '<p class="small muted">This takes <strong>' + esc(item.client) + "</strong> off the chase straight away. " +
+    "Next week's report confirms it &mdash; if it is still on the list then, it comes back flagged.</p>" +
+    '<div class="field"><label>What happened? (optional)</label>' +
+    '<input type="text" id="csaNote" placeholder="Signed and returned 21 Oct"></div>',
+    "Mark signed", async () => {
+      const st = {
+        threadId, entityId: item.entityId, adviser: item.adviser,
+        markedBy: noteAuthor(), markedAt: new Date().toISOString(),
+        disputedAt: "", note: ($("#csaNote") || {}).value || ""
+      };
+      state.csaStatus[threadId] = st;
+      try { await writeCsaStatus(st); } catch (e) {
+        delete state.csaStatus[threadId];
+        toast("Could not save that. " + ((e && e.message) || e), "bad");
+      }
+      render();
+    });
+}
+
+async function undoCsaSigned(threadId) {
+  const st = state.csaStatus[threadId];
+  if (!st) return;
+  if (!confirm("Put this back on the chase?")) return;
+  try { await clearCsaStatus(threadId); toast("Back on the list."); }
+  catch (e) { toast("Could not undo that. " + ((e && e.message) || e), "bad"); }
+  render();
+}
+
+async function queueCsaReminders() {
+  const csa = buildCsa();
+  if (!csa) return;
+  if (!sp.lists.notifications) {
+    toast("The " + LIST_TITLES.notifications + " list does not exist yet, so nothing can be queued.", "bad");
+    return;
+  }
+  const planned = csaNotifications(csa);
+  if (!planned.length) { toast("Nothing due in the next " + CSA_WEEKLY_DAYS + " days.", "bad"); return; }
+
+  const now = planned.filter(r => r.NotifyStatus === "Queued").length;
+  if (!confirm(planned.length + " message" + (planned.length === 1 ? "" : "s") + " over the next " +
+      CSA_WEEKLY_DAYS + " days, for " + new Set(planned.map(r => r.Adviser)).size + " advisers — " +
+      now + " today, " + (planned.length - now) + " scheduled.\n\n" +
+      "Anything still waiting from an earlier queue is replaced, and anything already sent today " +
+      "is not sent again. Continue?")) return;
+
+  const cleared = await clearCsaQueue();
+  const rows = planned.filter(r => !cleared.already.has(csaMsgKey(r.Adviser, r.Kind, r.DueAt)));
+  const skipped = planned.length - rows.length;
+  const sent = rows.length ? await sendNotifications(rows) : 0;
+
+  /* Stamped on the dump itself, so the screen can say when a report has been
+     loaded but never chased off — the one way this goes quiet without anyone
+     choosing it. */
+  if (state.csa) {
+    state.csa.queuedAt = new Date().toISOString();
+    try { await spPutFile(CSA_FILE, JSON.stringify(state.csa)); } catch (e) { /* the stamp is a nicety */ }
+  }
+  toast(sent + " queued" +
+    (cleared.cancelled ? ", " + cleared.cancelled + " superseded" : "") +
+    (skipped ? ", " + skipped + " already sent" : "") + ".", sent || skipped ? "good" : "bad");
+  render();
 }
 
 function openImportDialog(fileName, recs, missing) {
