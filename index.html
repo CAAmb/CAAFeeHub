@@ -946,8 +946,6 @@ const EMPTY_RATE_CARD = {
      that drift apart. loadAll() migrates an older card's list across. */
 };
 
-const EMPTY_ADVISERS = [];
-
 /* Funds, and the most each will let us draw from an account.
 
    This is not Coastal pricing — it is the platform's own limit on ongoing
@@ -1191,9 +1189,11 @@ function normaliseFund(f) {
 /* What a fund will actually allow on a balance, converted onto the same GST
    basis as our own fees so the two are comparable. Returns null when the fund
    has no cap at all, which is a real answer — several platforms have none. */
-function fundCap(fund, balance) {
+function fundCap(fund, balance, card) {
   if (!fund) return null;
-  const rc = state.rateCard;
+  /* The card the month is priced against — a locked month's own GST settings,
+     not whatever they are today. */
+  const rc = card || state.rateCard;
   const gst = 1 + num(rc.gstRate || 0);
   /* Our fees and their cap have to be on the same footing before comparing. */
   const toOurBasis = v => {
@@ -1471,6 +1471,15 @@ async function spGetFile(path) {
   return res.json();
 }
 
+/* Sends a library file to the site recycle bin, where it can be restored for
+   93 days. Already gone is the outcome being asked for, not a failure. */
+async function spDeleteFile(path) {
+  const token = await getToken(false);
+  const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
+    "/root:/" + encodeURI(path), { method: "DELETE", headers: { Authorization: "Bearer " + token } });
+  if (!res.ok && res.status !== 404) throw new Error("Could not remove " + path + " (" + res.status + " " + res.statusText + ").");
+}
+
 /* "Failed to fetch" is what a CSP-blocked request looks like from inside the
    page, and it says nothing about which request or why. Since the one thing
    that can produce it here is the SharePoint redirect above, say so rather
@@ -1668,6 +1677,10 @@ async function loadRunIndex() {
       rowCount: num(f.RowCount),
       createdAt: i.createdDateTime || "",
       rateCardSnapshot: snap.rateCard || null,
+      /* True once the snapshot is the pricing the month was LOCKED with. A
+         snapshot without it was taken at import and has never priced anything —
+         see freezeLegacyLockedRuns(). */
+      pricingFrozen: !!snap.frozen,
       fundsSnapshot: snap.funds || [],
       /* Read back so a later save of the same run rewrites it rather than
          blanking the column. */
@@ -1813,12 +1826,78 @@ async function reconcileCsa() {
    for 93 days. Mark-offs are left exactly as they were — they are advisers'
    work, and nothing a report does at upload touches them any more. */
 async function removeCsaReport() {
-  const token = await getToken(false);
-  const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
-    "/root:/" + encodeURI(CSA_FILE), { method: "DELETE", headers: { Authorization: "Bearer " + token } });
-  /* Already gone is the outcome being asked for, not a failure. */
-  if (!res.ok && res.status !== 404) throw new Error("Could not remove the report (" + res.status + " " + res.statusText + ").");
+  await spDeleteFile(CSA_FILE);
   state.csa = null;
+}
+
+/* The Overrides rows for a run — one per adviser — whether or not that run is
+   open. Only the open month has its ids in memory; the rest have to be asked
+   for, and assuming otherwise is how replacing or deleting an unopened month
+   would quietly leave its adviser edits behind. */
+async function overrideIdsFor(key) {
+  if (sp.overrideIds[key] && state.runs[key] && state.runs[key].loaded) return { ...sp.overrideIds[key] };
+  const out = {};
+  for (const i of await spItems("overrides")) {
+    const f = i.fields || {};
+    if (String(f.RunKey || "") === key) out[String(f.Adviser || "")] = i.id;
+  }
+  return out;
+}
+
+/* What deleting a month would touch, counted before anybody is asked to
+   confirm it — so the dialog states consequences instead of warning in general. */
+async function runFootprint(key) {
+  const ov = await overrideIdsFor(key);
+  let started = 0, submitted = 0;
+  const run = state.runs[key];
+  if (run && run.loaded) {
+    for (const s of Object.values(run.adviserStatus || {})) {
+      if (s.status !== "Not started") started++;
+      if (s.status === "Submitted" || s.status === "Approved") submitted++;
+    }
+  } else {
+    for (const i of await spItems("overrides")) {
+      const f = i.fields || {};
+      if (String(f.RunKey || "") !== key) continue;
+      if (f.AdviserStatus && f.AdviserStatus !== "Not started") started++;
+      if (f.AdviserStatus === "Submitted" || f.AdviserStatus === "Approved") submitted++;
+    }
+  }
+  let scheduled = 0;
+  if (sp.lists.notifications) {
+    for (const i of await spItems("notifications")) {
+      const f = i.fields || {};
+      if (String(f.RunKey || "") === key && f.NotifyStatus === "Scheduled") scheduled++;
+    }
+  }
+  return { overrides: Object.keys(ov).length, started, submitted, scheduled };
+}
+
+/* Takes a month off the site entirely: its scheduled reminders, its adviser
+   rows, its run row and its extract. In that order, so that if anything fails
+   part-way the reminders have already stopped and the run is still there to
+   try again — never a run that has gone while its reminders still chase.
+
+   Everything deleted lands in the site recycle bin, which is the undo. */
+async function deleteRun(key) {
+  if (sp.lists.notifications) {
+    for (const i of await spItems("notifications")) {
+      const f = i.fields || {};
+      if (String(f.RunKey || "") === key && f.NotifyStatus === "Scheduled") {
+        await spUpdate("notifications", i.id, { NotifyStatus: "Cancelled" });
+      }
+    }
+  }
+  for (const id of Object.values(await overrideIdsFor(key))) {
+    try { await spDelete("overrides", id); } catch (e) { /* already gone is fine */ }
+  }
+  if (sp.runIds[key]) await spDelete("runs", sp.runIds[key]);
+  await spDeleteFile(runFilePath(key));
+
+  delete state.runs[key];
+  delete sp.runIds[key];
+  delete sp.overrideIds[key];
+  delete sp.lastOverride[key];
 }
 
 /* ---- writes ----
@@ -1907,7 +1986,7 @@ async function writeRun() {
     RunStatus: run.status,
     RowCount: (run.rows || []).length,
     SourceFile: run.sourceName || "",
-    RateCardSnapshot: JSON.stringify({ rateCard: run.rateCardSnapshot, funds: run.fundsSnapshot })
+    RateCardSnapshot: runSnapshotJson(run)
   };
   if (run.summary) {
     const json = JSON.stringify(run.summary);
@@ -2401,15 +2480,18 @@ async function publishRun(key, recs, fileName, existed) {
       Title: key,
       RunYear: +key.slice(0, 4), RunMonth: +key.slice(5, 7),
       RunStatus: run.status, RowCount: recs.length, SourceFile: fileName || "",
-      RateCardSnapshot: JSON.stringify({ rateCard: run.rateCardSnapshot, funds: run.fundsSnapshot })
+      RateCardSnapshot: runSnapshotJson(run)
     };
     if (sp.runIds[key]) await spUpdate("runs", sp.runIds[key], fields);
     else sp.runIds[key] = (await spCreate("runs", fields)).id;
 
     /* Replacing a month means its adviser edits are gone; leaving the old
-       override rows behind would silently reapply them to new client ids. */
+       override rows behind would silently reapply them to new client ids.
+       Asked of the list rather than read from memory — the month being
+       replaced is often not the open one, and only the open one has its ids
+       loaded, so this used to delete nothing in exactly that case. */
     if (existed) {
-      for (const [adviser, id] of Object.entries(sp.overrideIds[key] || {})) {
+      for (const id of Object.values(await overrideIdsFor(key))) {
         try { await spDelete("overrides", id); } catch (e) { /* already gone is fine */ }
       }
     }
@@ -3247,11 +3329,82 @@ function myRegionCovers(region) {
    The engine — the workbook's columns M through AK, in order.
    Every step below maps to a named column so the two can be reconciled.
    ========================================================================= */
+/* Which pricing a month is calculated against. An open month uses the live card
+   and fund caps, so a fix made mid-review — a category mapped, a cap corrected —
+   reaches it straight away. A locked or sent month uses the snapshot it kept, so
+   changing the card afterwards cannot rewrite a month that has been signed off.
+   That was always the promise on Rate/Fee Settings; until now every month was
+   priced from the live card regardless. */
+const FROZEN_STATUS = ["Locked", "Sent"];
+function pricingFor(run) {
+  /* `pricingFrozen` as well as the status: a month locked before this existed
+     carries an import-time snapshot that has never priced anything, and
+     switching to it would change what that month shows. Those keep the live
+     card until freezeLegacyLockedRuns() has captured it for them. */
+  if (!run || !FROZEN_STATUS.includes(run.status) || !run.pricingFrozen || !run.rateCardSnapshot) {
+    return { rc: state.rateCard, funds: state.funds, frozen: false };
+  }
+  if (!run._frozen) {
+    run._frozen = {
+      rc: hydrateCard(JSON.parse(JSON.stringify(run.rateCardSnapshot))),
+      funds: Array.isArray(run.fundsSnapshot) && run.fundsSnapshot.length ? run.fundsSnapshot : state.funds
+    };
+  }
+  return { ...run._frozen, frozen: true };
+}
+
+/* The card the open month is priced with — its own snapshot if it is locked. */
+const monthCard = () => (state.calc && state.calc.rc) || state.rateCard;
+
+/* What goes in a run's RateCardSnapshot column. One shape, written from both
+   places a run is saved, so the frozen flag cannot be dropped by one of them. */
+const runSnapshotJson = run => JSON.stringify({
+  rateCard: run.rateCardSnapshot, funds: run.fundsSnapshot, frozen: !!run.pricingFrozen
+});
+
+/* Months that were locked before locked months kept their own pricing. Every
+   one of them has, until now, been shown against the live card — so the live
+   card as it stands at this moment IS what each has been showing. Capture it as
+   theirs, once, so a fee entered afterwards cannot reach back into them.
+
+   Run at sign-in by someone who manages runs, before anything else can be
+   edited. Only a Manager or Admin can change the card, and they are exactly the
+   people this runs for — so a locked month is always frozen before the first
+   fee change it could have been exposed to. */
+async function freezeLegacyLockedRuns() {
+  if (!can("run")) return 0;
+  let n = 0;
+  for (const run of Object.values(state.runs)) {
+    if (!FROZEN_STATUS.includes(run.status) || run.pricingFrozen) continue;
+    run.rateCardSnapshot = JSON.parse(JSON.stringify(state.rateCard));
+    run.fundsSnapshot = JSON.parse(JSON.stringify(state.funds));
+    run.pricingFrozen = true;
+    delete run._frozen;
+    try {
+      if (sp.runIds[run.key]) await spUpdate("runs", sp.runIds[run.key], { RateCardSnapshot: runSnapshotJson(run) });
+      n++;
+    } catch (e) {
+      /* Not written, so not frozen — leave it on the live card and try again
+         at the next sign-in rather than pretend. */
+      run.pricingFrozen = false;
+    }
+  }
+  return n;
+}
+
+/* A tier's base fee. Each tier now carries one of its own, separate from the
+   lower limit that places it in its band. A tier with no fee set yet falls back
+   to its lower limit — exactly how it priced before the two were separated — so
+   nothing moves on the day this ships, only when somebody enters the fees. */
+const tierFee = c => (c.fee === "" || c.fee === null || c.fee === undefined) ? num(c.annual) : num(c.fee);
+const tierFeeSet = c => !(c.fee === "" || c.fee === null || c.fee === undefined);
+
 function calculate(run) {
-  const rc = state.rateCard;
+  const priced = pricingFor(run);
+  const rc = priced.rc;
   const overrides = run.overrides || {};
   const advIndex = new Map(state.advisers.map(a => [a.name, a]));
-  const catIndex = new Map(rc.categories.map(c => [String(c.name).toLowerCase(), c.annual]));
+  const catIndex = new Map(rc.categories.map(c => [String(c.name).toLowerCase(), tierFee(c)]));
   /* The top of each tier's band, so a fee can be checked against the tier it is
      supposed to sit in. Null for the open-ended top tier. */
   const bands = categoryBands(rc);
@@ -3261,7 +3414,7 @@ function calculate(run) {
   const tierOrder = [...new Map(bands.map(b => [b.from, { from: b.from, name: b.c.name }])).values()]
     .sort((a, b) => a.from - b.from);
   const weightIndex = new Map(rc.entityWeights.map(w => [String(w.name).toLowerCase(), w.weight]));
-  const funds = buildFundIndex(state.funds);
+  const funds = buildFundIndex(priced.funds);
 
   /* Keys are taken from the position in the untouched extract, before anything
      is added or hidden, so an override stays attached to its fund no matter what
@@ -3416,9 +3569,18 @@ function calculate(run) {
     if (base == null) {
       unpricedCats.set(m.category || "(blank)", (unpricedCats.get(m.category || "(blank)") || 0) + 1);
       m.rateCardFee = null;                                                     // W — cannot be priced
+      m.rateCardFormula = null;
+      m.rateCardBy = null;
     } else {
-      /* W — the fee never falls below what the client pays today. */
-      m.rateCardFee = Math.max(base + m.entityFee + m.surcharge, m.currentFee, rc.absoluteMinimum);
+      /* W — the fee never falls below what the client pays today. Which of the
+         three won is kept, because the screen shows the formula's parts under
+         the fee, and when the current fee wins those parts do not add up to the
+         figure above them — "$1 + $0 + $1,883" under $4,760 reads as a sum that
+         is wrong, when it is a floor that held. */
+      m.rateCardFormula = base + m.entityFee + m.surcharge;
+      m.rateCardFee = Math.max(m.rateCardFormula, m.currentFee, rc.absoluteMinimum);
+      m.rateCardBy = m.rateCardFee === m.rateCardFormula ? "formula"
+                   : m.rateCardFee === m.currentFee ? "current" : "minimum";
     }
 
     /* A client whose rate card fee climbs past the top of their own tier has
@@ -3544,7 +3706,7 @@ function calculate(run) {
       r.cap = null; r.capValue = null; r.capBinding = ""; r.overCap = false; r.overCapBy = null;
       r.underMinBalance = false;
       if (!r.included) continue;
-      const cap = fundCap(r.fund, r.valueUsed);
+      const cap = fundCap(r.fund, r.valueUsed, rc);
       if (cap) {
         r.cap = cap;
         r.capValue = cap.value;
@@ -3716,6 +3878,10 @@ function calculate(run) {
 
   return {
     rows, masters: out, removed,
+    /* The card this month was actually priced with, so the screens describing
+       it — the off-band label, the printed report — quote the same figures
+       the calculation used, which for a locked month is its own snapshot. */
+    rc, frozen: priced.frozen,
     categories: [...catSeen.values()].sort((a, b) => b.clients - a.clients),
     ambiguous,
     unpricedCats: [...unpricedCats.entries()].sort((a, b) => b[1] - a[1]),
@@ -4082,6 +4248,9 @@ async function startSession() {
     renderGate();
     await loadReference();
     await loadRunIndex();
+    /* Before anything can be edited — see the function for why the order
+       matters. Failures leave a month on the live card, never half-frozen. */
+    try { await freezeLegacyLockedRuns(); } catch (e) { /* retried at the next sign-in */ }
     if (state.runKey) await loadRun(state.runKey);
     /* Last, and swallowing its own failures: the CSA tracker is a screen, not a
        dependency, and a site without its list yet must still open. */
@@ -4212,7 +4381,9 @@ function render() {
     : run
     ? monthLabel(run.key) + ' &middot; <span class="pill ' + statusPill(run.status) + '">' +
       esc(adviserMode ? adviserState(state.asAdviser).status : run.status) + "</span>" +
-      (can("run") ? " &middot; " + run.rows.length.toLocaleString("en-AU") + " rows" : "")
+      /* rowCount when the rows are not in memory — a month whose extract failed
+         to load must still leave a working screen, not a blank one. */
+      (can("run") ? " &middot; " + num(Array.isArray(run.rows) ? run.rows.length : run.rowCount).toLocaleString("en-AU") + " rows" : "")
     : "No run loaded";
 
   const id = state.identity;
@@ -4247,6 +4418,17 @@ function render() {
      screen should start at the top, not wherever the last one was left. */
   const wrap = renderedView === state.view ? document.querySelector(".tbl-wrap") : null;
   const at = wrap ? { top: wrap.scrollTop, left: wrap.scrollLeft } : null;
+  /* The screens that read a month's clients cannot be drawn when that month's
+     extract failed to come back from the site. One guard here rather than one
+     per screen: every one of them reads state.calc, and each that forgot to
+     check went blank instead of saying why. */
+  const needsMonth = ["review", "exceptions", "approvals"].includes(state.view);
+  if (needsMonth && run && !state.calc) {
+    $("#page").innerHTML = '<div class="banner bad"><strong>' + esc(monthLabel(run.key)) + " did not load.</strong> " +
+      "Its extract could not be read from the site. Choose it again in the month picker at the top to retry.</div>";
+    renderedView = state.view;
+    return;
+  }
   $("#page").innerHTML = fn ? fn() : "";
   if (fn) wire();
   if (at) {
@@ -4313,7 +4495,18 @@ function renderTopActions() {
     /* The month's shape, captured at the one moment it is finished. Built
        before the status change so it is written by the same save. */
     const r = currentRun();
-    if (r) r.summary = buildRunSummary(r, state.calc);
+    if (r) {
+      r.summary = buildRunSummary(r, state.calc);
+      /* And the pricing it was approved against. Taken here rather than kept
+         from import, because the card is allowed to change while a month is
+         open — a category gets mapped, a cap gets corrected — and the record
+         has to be what was signed off, not what the month started with. From
+         here on a locked month prices from this, never from the live card. */
+      r.rateCardSnapshot = JSON.parse(JSON.stringify(state.rateCard));
+      r.fundsSnapshot = JSON.parse(JSON.stringify(state.funds));
+      r.pricingFrozen = true;
+      delete r._frozen;
+    }
     setStatus("Locked");
     celebrate();
   });
@@ -4341,6 +4534,13 @@ function viewRun() {
     "</div></div><div class=\"spacer\"></div>";
 
   if (!run) return html + '<div class="banner warn">No run loaded yet. Drop a report above to get started.</div>';
+  /* A month whose extract failed to come back from the site — a dropped
+     connection, usually. Said plainly, with the way out, rather than a screen
+     that reads figures from a calculation that never ran. */
+  if (!state.calc) {
+    return html + '<div class="banner bad"><strong>' + esc(monthLabel(run.key)) + " did not load.</strong> " +
+      "Its extract could not be read from the site. Choose it again in the month picker at the top to retry.</div>";
+  }
 
   const priced = c.masters.filter(m => m.rateCardFee != null);
   const totalCurrent = c.masters.reduce((a, m) => a + (m.currentFee || 0), 0);
@@ -4603,7 +4803,7 @@ function clientTable(list, locked) {
     const under = m.outsideBand && m.diffToCard != null && m.diffToCard < 0;
     const bandFlag = (m.outsideBand
         ? ' <span class="pill ' + (under ? "bad" : "ok") + '" title="' + (under ? "Below" : "Above") + " the rate card by more than " +
-          (state.rateCard.variancePct * 100) + '%">' + (under ? "&darr; " : "&uarr; ") + money(Math.abs(m.diffToCard)) + " off band</span>"
+          (monthCard().variancePct * 100) + '%">' + (under ? "&darr; " : "&uarr; ") + money(Math.abs(m.diffToCard)) + " off band</span>"
         : "") +
       (m.belowCurrent ? ' <span class="pill bad" title="Lower than the fee the client pays today">below current</span>' : "") +
       (m.overCap ? ' <span class="pill bad" title="' +
@@ -4644,8 +4844,7 @@ function clientTable(list, locked) {
           'It should have been set before the month opened — notify admin rather than pricing round it.">no rate</span>' : "") + "</td>" +
       '<td class="num">' + money(m.totalFum) + "</td>" +
       '<td class="num">' + money(m.currentFee) + "</td>" +
-      '<td class="num">' + money(m.rateCardFee) +
-        '<div class="small muted">' + (m.baseFee == null ? "&mdash;" : money(m.baseFee) + " + " + money(m.entityFee) + " + " + money(m.surcharge)) + "</div></td>" +
+      '<td class="num">' + money(m.rateCardFee) + rateCardBreakdown(m) + "</td>" +
       "<td>" + modeCell(m) + "</td>" +
       '<td>' + feeCell(m, locked) + bandFlag + "</td>" +
       "<td>" + pctCell(m, locked) + "</td>" +
@@ -4715,6 +4914,22 @@ function feeTypeLabel(m) {
   return m.mode === "Variable" ? "By fund"
        : m.mode === "Percentage" ? "% of FUM"
        : m.mode === "Fixed Fee" ? "Fixed fee" : "Rate card";
+}
+
+/* Under the rate card fee: what made it. The parts are named, zero parts are
+   left out, and when a floor won — the client's current fee, or the absolute
+   minimum — that is said first, with the formula's own total after it, so the
+   line under the figure always adds up to something it actually states. */
+function rateCardBreakdown(m) {
+  if (m.baseFee == null) return '<div class="small muted">&mdash;</div>';
+  const parts = [esc(m.mappedTo || m.category || "Tier") + " " + money(m.baseFee)];
+  if (m.entityFee) parts.push("entities " + money(m.entityFee));
+  if (m.surcharge) parts.push("FUM " + money(m.surcharge));
+  const sum = parts.join(" + ");
+  if (m.rateCardBy === "formula") return '<div class="small muted">' + sum + "</div>";
+  return '<div class="small muted">' +
+    (m.rateCardBy === "current" ? "held at current fee" : "raised to the minimum") + "</div>" +
+    '<div class="small muted">' + sum + (parts.length > 1 ? " = " + money(m.rateCardFormula) : "") + "</div>";
 }
 
 /* The client line reports how the client is being priced; it no longer decides
@@ -6134,6 +6349,7 @@ function settingsTiles(sections) {
 function reviewSections(ro) {
   const rc = state.rateCard, c = state.calc;
   const unpriced = rc.categories.filter(x => !(num(x.annual) > 0)).length;
+  const noFee = rc.categories.filter(x => !tierFeeSet(x)).length;
   const bandCount = new Set(rc.categories.map(x => num(x.annual))).size;
   const capless = state.funds.filter(f => f.active !== false && !(f.capPct > 0) && !(f.capAmount > 0)).length;
   const fundTrouble = c ? (c.unknownFunds.length + c.noPlatform.length + c.fundClashes.length) : 0;
@@ -6144,12 +6360,13 @@ function reviewSections(ro) {
       meta: rc.categories.length + (rc.categories.length === 1 ? " tier" : " tiers") +
         (bandCount && bandCount !== rc.categories.length ? " · " + bandCount + " bands" : ""),
       warn: !rc.categories.length ? "none set"
-          : unpriced ? unpriced + " with no lower limit" : "",
+          : unpriced ? unpriced + " with no lower limit"
+          : noFee ? noFee + " with no base fee" : "",
       actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px"><button class="btn ghost btn-sm" id="btnAddCat">Add category</button></div>',
       body: () => {
         const bands = categoryBands(rc);
         return '<div class="tbl-scroll"><table><thead><tr><th>Category</th>' +
-          '<th class="num">From</th><th class="num">To</th><th>Covers</th>' +
+          '<th class="num">From</th><th class="num">To</th><th class="num">Base fee</th><th>Covers</th>' +
           (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
           bands.map(b =>
             '<tr><td><input type="text" class="grow-x" data-rc="cat" data-i="' + b.i + '" data-f="name" value="' +
@@ -6159,6 +6376,12 @@ function reviewSections(ro) {
             /* Derived, so it is shown rather than typed — two typed limits can
                disagree and leave a client in the gap between two tiers. */
             '<td class="num mono">' + (b.to == null ? "&mdash;" : money(b.to)) + "</td>" +
+            /* The fee is separate from the band. Empty until somebody sets it,
+               and says what it is pricing from in the meantime rather than
+               leaving a blank box that looks like $0. */
+            '<td class="num"><input type="number" class="w110 num" data-rc="cat" data-i="' + b.i +
+              '" data-f="fee" value="' + (tierFeeSet(b.c) ? num(b.c.fee) : "") + '" placeholder="not set"' + ro + ">" +
+              (tierFeeSet(b.c) ? "" : '<div class="small muted">using ' + money(num(b.c.annual)) + "</div>") + "</td>" +
             '<td class="small muted">' + esc(bandLabel(b)) +
               (b.sharedWith ? "<div>shares this band with " + b.sharedWith + " other" +
                 (b.sharedWith > 1 ? "s" : "") + "</div>" : "") + "</td>" +
@@ -6173,8 +6396,12 @@ function reviewSections(ro) {
           "<code>Private Wealth</code> at 22,000 are three names for the same tier. That is what the " +
           "<strong>Category mapping</strong> section is for if you would rather keep one row per tier and point the " +
           "Xplan codes at it." +
-          "<br><br>The lower limit is also the <strong>base fee</strong> for that tier: it is what a client in it starts " +
-          "at before entities and the FUM surcharge are added.</div>";
+          "<br><br><strong>The band and the fee are separate.</strong> <em>From</em> and <em>To</em> decide which tier a " +
+          "fee belongs in &mdash; it is what the <em>above tier</em> flag checks against. <em>Base fee</em> is what a " +
+          "client in that tier starts at, before entities and the FUM surcharge are added. A tier with no base fee " +
+          "set prices from its lower limit, as it did before the two were split." +
+          "<br><br><strong>Changing a fee reprices any month that is still open</strong>, the moment it saves. Locked " +
+          "months keep the pricing they were approved with.</div>";
       } },
 
     { key: "entities", title: "Additional entities",
@@ -6842,46 +7069,52 @@ function viewSettings() {
      in a third of the page. */
   let html = "";
 
+  /* The app will not start without a client ID, so by the time anybody can see
+     this screen it is connected — there is no "local" branch left to show. */
   html += '<div class="card" style="margin-bottom:16px"><div class="card-h"><h2>Connection</h2>' +
-    '<div class="right no-print">' + (connected()
-      ? '<button class="btn ghost btn-sm" id="btnCheckConn">Check lists</button>'
-      : "") + "</div></div><div class=\"card-b\">" +
-    '<div class="kv"><div class="k">Mode</div><div class="v">' + (connected() ? "Entra + SharePoint" : "Local browser storage") + "</div>" +
-    '<div class="k">Tenant</div><div class="v mono">' + esc(CONFIG.tenantId) + "</div>" +
+    '<div class="right no-print"><button class="btn ghost btn-sm" id="btnCheckConn">Check lists</button></div>' +
+    "</div><div class=\"card-b\">" +
+    '<div class="kv"><div class="k">Tenant</div><div class="v mono">' + esc(CONFIG.tenantId) + "</div>" +
     '<div class="k">Site</div><div class="v mono">' + esc(CONFIG.sitePath.split(":/").pop()) + "</div>" +
-    '<div class="k">Client ID</div><div class="v mono">' + (connected() ? esc(CONFIG.clientId) : "not set") + "</div>" +
+    '<div class="k">Client ID</div><div class="v mono">' + esc(CONFIG.clientId) + "</div>" +
     /* The single most common first-connection failure is this URL not being
        registered, so show exactly what the app will ask Entra for. */
     '<div class="k">Redirect URI</div><div class="v mono">' + esc(redirectUri()) + "</div></div>" +
     '<div class="spacer"></div>' +
-    (connected()
-      ? '<div class="small muted">Checks every list and column against what the app expects, and names anything wrong.</div>'
-      : '<div class="small muted">Waiting on the Entra app registration &mdash; the ask is in <code>SETUP.md</code>. Paste the ' +
-        'client ID into <code>CONFIG.clientId</code> at the top of this file and the check below becomes available.</div>') +
+    '<div class="small muted">Checks every list and column against what the app expects, and names anything wrong.</div>' +
     '<div id="connResult"></div></div></div>';
 
-  html += '<div class="grid2">';
-  html += '<div class="card"><div class="card-h"><h2>Stored runs</h2></div><div class="card-b">';
+  html += '<div class="grid2 top">';
+  /* Only the month that is open has its rows in memory — the rest are fetched
+     when somebody opens them — so the count comes from what the run recorded
+     when it was imported, not from rows that are not loaded. Reading
+     `.rows.length` here broke the whole screen the moment a second month
+     existed.
+
+     Delete is for an import that should not exist at all — the wrong month
+     chosen in the dialog. A wrong FILE in the right month is fixed by importing
+     again, which replaces it. A locked month is a signed-off record, so it has
+     to be reopened before it can go; that is one deliberate step between a
+     slip of the mouse and a month of approvals. */
+  const deletable = s => s === "Draft" || s === "Open for Review";
+  html += '<div class="card"><div class="card-h"><h2>Runs</h2></div><div class="card-b">';
   html += runs.length
     ? '<table><thead><tr><th>Month</th><th>Status</th><th class="num">Rows</th><th class="no-print"></th></tr></thead><tbody>' +
-      runs.map(k => "<tr><td>" + esc(monthLabel(k)) + '</td><td><span class="pill ' + statusPill(state.runs[k].status) + '">' +
-        esc(state.runs[k].status) + '</span></td><td class="num">' + state.runs[k].rows.length.toLocaleString("en-AU") +
-        '</td><td class="no-print"><button class="btn ghost btn-sm" data-delrun="' + esc(k) + '">Delete</button></td></tr>').join("") +
+      runs.map(k => {
+        const r = state.runs[k];
+        const rows = Array.isArray(r.rows) ? r.rows.length : num(r.rowCount);
+        return "<tr><td>" + esc(monthLabel(k)) + (k === state.runKey ? ' <span class="small muted">open</span>' : "") +
+          '</td><td><span class="pill ' + statusPill(r.status) + '">' + esc(r.status) + "</span></td>" +
+          '<td class="num">' + rows.toLocaleString("en-AU") + "</td>" +
+          '<td class="no-print">' + (deletable(r.status)
+            ? '<button class="btn ghost btn-sm" data-delrun="' + esc(k) + '">Delete</button>'
+            : '<span class="small muted" title="Reopen it on Run/Dashboard first">locked</span>') + "</td></tr>";
+      }).join("") +
       "</tbody></table>"
-    : '<div class="muted">No runs stored yet.</div>';
-  html += "</div></div>";
-
-  html += '<div class="card"><div class="card-h"><h2>Reference data</h2></div><div class="card-b">' +
-    '<div class="kv"><div class="k">Rate card</div><div class="v">' +
-      (state.rateCard.categories.length
-        ? state.rateCard.categories.length + " categories"
-        : "not set") + "</div>" +
-    '<div class="k">Advisers</div><div class="v">' +
-      (state.advisers.length ? state.advisers.length + " listed" : "not set") + "</div></div>" +
-    '<div class="spacer"></div><div class="small muted">Pricing and adviser names are not held in the application file &mdash; they ' +
-    'live in the SharePoint lists, or in this browser until it is connected. Clearing empties both so they can be entered fresh; ' +
-    'runs are left alone.</div>' +
-    '<div class="spacer"></div><button class="btn ghost" id="btnResetRef">Clear rate card &amp; advisers</button></div></div>';
+    : '<div class="muted">No runs yet.</div>';
+  html += '<div class="spacer"></div><div class="small muted"><strong>Wrong file, right month:</strong> import it again on ' +
+    "Run/Dashboard &mdash; that replaces it. <strong>Wrong month altogether:</strong> delete it here. A locked month has to be " +
+    "reopened first.</div></div></div>";
 
   html += '<div class="card"><div class="card-h"><h2>Review options</h2></div><div class="card-b">' +
     '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" id="optDefaults"' +
@@ -6895,6 +7128,73 @@ function viewSettings() {
 
   html += "</div>";
   return html;
+}
+
+/* The confirmation says exactly what goes — counted first — and asks for the
+   month to be typed when advisers have already worked on it. An accidental
+   import nobody has touched is one click to remove; a month with submissions
+   in it is not, because that is somebody's work. */
+async function confirmDeleteRun(key) {
+  const run = state.runs[key];
+  if (!run) return;
+  let fp;
+  try { fp = await runFootprint(key); }
+  catch (e) { toast("Could not check that month. " + ((e && e.message) || e), "bad"); return; }
+
+  const label = monthLabel(key);
+  const worked = fp.started > 0;
+  const lines = [
+    "The extract — " + num(Array.isArray(run.rows) ? run.rows.length : run.rowCount).toLocaleString("en-AU") + " rows",
+    fp.overrides
+      ? fp.overrides + " adviser record" + (fp.overrides === 1 ? "" : "s") +
+        (fp.started ? " — " + fp.started + " started" + (fp.submitted ? ", " + fp.submitted + " submitted or approved" : "") : " — none started")
+      : "No adviser has opened it",
+    fp.scheduled
+      ? fp.scheduled + " scheduled reminder" + (fp.scheduled === 1 ? "" : "s") + ", cancelled"
+      : "No reminders waiting"
+  ];
+
+  showDialog("Delete " + label,
+    "<p>This removes the month from the site:</p><ul>" + lines.map(l => "<li>" + esc(l) + "</li>").join("") + "</ul>" +
+    (run.status === "Open for Review"
+      ? '<div class="banner warn">This month was <strong>opened for review</strong>, so advisers have had the ' +
+        "<em>Review ready</em> email. That cannot be recalled &mdash; let them know it was a mistake.</div>"
+      : "") +
+    (worked
+      ? '<div class="banner bad"><strong>Advisers have worked on this month.</strong> Their edits and comments go with it. ' +
+        'Type <strong>' + esc(label) + "</strong> to confirm.</div>" +
+        '<div class="field"><input type="text" id="delRunConfirm" autocomplete="off" placeholder="' + esc(label) + '"></div>'
+      : "") +
+    '<div class="small muted">Everything goes to the site recycle bin and can be restored from there for 93 days.</div>',
+    /* Synchronous on purpose. The dialog only stays open when this returns
+       false, and an async function returns a promise — so a mistyped month
+       would close it and make the person start again. Check first, then hand
+       the slow part off. */
+    "Delete month", () => {
+      if (worked && (($("#delRunConfirm") || {}).value || "").trim().toLowerCase() !== label.toLowerCase()) {
+        toast("Type " + label + " to confirm.", "bad");
+        return false;
+      }
+      (async () => {
+        try {
+          toast("Deleting " + label + "…");
+          await deleteRun(key);
+          toast(label + " deleted.", "good");
+          if (state.runKey === key) {
+            const next = Object.keys(state.runs).sort().pop() || null;
+            state.runKey = null;
+            if (next) { await openRun(next); return; }
+            state.calc = null;
+          }
+          saveUi();
+          render();
+        } catch (e) {
+          toast("Could not finish deleting " + label + ". " + ((e && e.message) || e) +
+            " Anything already removed is in the recycle bin; try again to finish.", "bad");
+          render();
+        }
+      })();
+    });
 }
 
 /* Kept separate from checkConnection so the report can be rendered from a
@@ -7372,7 +7672,11 @@ function wire() {
     el.addEventListener("change", () => {
       const bucket = { cat: "categories", wt: "entityWeights", band: "surchargeBands" }[el.dataset.rc];
       const f = el.dataset.f;
-      state.rateCard[bucket][+el.dataset.i][f] = (f === "name") ? el.value : num(el.value);
+      /* An emptied base fee stays empty rather than becoming $0 — empty means
+         "not set, price from the lower limit", while 0 is a real fee of nothing. */
+      state.rateCard[bucket][+el.dataset.i][f] = (f === "name") ? el.value
+        : (f === "fee" && String(el.value).trim() === "") ? ""
+        : num(el.value);
       saveRateCard(); render();
     }));
   if ($("#optDefaults")) $("#optDefaults").addEventListener("change", e => {
@@ -7508,12 +7812,7 @@ function wire() {
 
   /* --- settings --- */
   document.querySelectorAll("[data-delrun]").forEach(el =>
-    el.addEventListener("click", () => {
-      if (!confirm("Delete the " + monthLabel(el.dataset.delrun) + " run? This cannot be undone.")) return;
-      delete state.runs[el.dataset.delrun];
-      if (state.runKey === el.dataset.delrun) state.runKey = Object.keys(state.runs).sort().pop() || null;
-      saveRuns(); saveUi(); render();
-    }));
+    el.addEventListener("click", () => confirmDeleteRun(el.dataset.delrun)));
   if ($("#btnCheckConn")) $("#btnCheckConn").addEventListener("click", async () => {
     const btn = $("#btnCheckConn"), box = $("#connResult");
     btn.disabled = true;
@@ -7527,13 +7826,10 @@ function wire() {
       btn.disabled = false;
     }
   });
-  if ($("#btnResetRef")) $("#btnResetRef").addEventListener("click", () => {
-    if (!confirm("Clear the rate card and adviser directory?\n\nBoth are emptied and will need entering again, or loading from SharePoint. Runs are not affected.")) return;
-    state.rateCard = JSON.parse(JSON.stringify(EMPTY_RATE_CARD));
-    state.advisers = JSON.parse(JSON.stringify(EMPTY_ADVISERS));
-    saveRateCard(); saveAdvisers(); render();
-    toast("Rate card and advisers cleared.", "good");
-  });
+  /* "Clear rate card & advisers" used to live here — a local-mode reset that,
+     on the live site, would have emptied the rate card and deleted every row in
+     the adviser directory, locking everybody out. Removed rather than guarded:
+     nothing a working team does needs it. */
 }
 
 /* An adviser touching anything moves them off "Not started" without a click. */
@@ -8116,7 +8412,7 @@ function buildReport(opts) {
     "<span><b>Status</b> " + esc(status) + "</span>" +
     "<span><b>Clients</b> " + list.length + "</span>" +
     (me ? "" : "<span><b>Advisers</b> " + new Set(list.map(m => m.adviser)).size + "</span>") +
-    "<span><b>Rate card</b> " + esc(state.rateCard.version || "not named") + "</span>" +
+    "<span><b>Rate card</b> " + esc(monthCard().version || "not named") + "</span>" +
     (run.sourceName ? "<span><b>Source</b> " + esc(run.sourceName) + "</span>" : "") +
     "<span><b>Prepared</b> " + esc(now) + "</span></div>";
 
@@ -8214,7 +8510,7 @@ function buildReport(opts) {
   if (anyFlag) {
     h += '<div class="legend"><b>Flags.</b> ' +
       "<i>no rate</i> — the category has no rate card entry, so the fee is not set. " +
-      "<i>off band</i> — more than " + (state.rateCard.variancePct * 100) + "% from the rate card fee. " +
+      "<i>off band</i> — more than " + (monthCard().variancePct * 100) + "% from the rate card fee. " +
       "<i>below current</i> — lower than the client pays today. " +
       "<i>over platform cap</i> — more than the platform will let us draw from an account; the maximum is shown. " +
       "<i>under platform minimum</i> — the balance is below what the platform needs before it will process a fee at all. " +
