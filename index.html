@@ -568,6 +568,61 @@ td input.num{text-align:right}
   border-radius:3px;padding:6px 9px;margin-bottom:12px}
 .rep .empty{font-size:9pt;color:#555;padding:8px 0}
 
+/* ---------------------------------------------------------------------------
+   The Pricing Calculator report. One page, answer first. Read by advice
+   production, kept on file for audit, and sometimes handed to the client — so
+   plain words, no internal shorthand.
+
+   The navy band is the one fill on the page, and it is drawn as an SVG rather
+   than a CSS background. A browser drops background colour unless "background
+   graphics" is ticked, and white figures on a dropped navy fill print as
+   nothing at all. An image always prints.
+   --------------------------------------------------------------------------- */
+.pq{color:#1b2a33;background:#fff;font-family:var(--font);font-size:9.4pt;line-height:1.45;
+  display:flex;flex-direction:column;min-height:268mm;padding:1mm 3mm 0;
+  -webkit-print-color-adjust:exact;print-color-adjust:exact}
+.pq-head{display:flex;align-items:flex-end;gap:16px;padding-bottom:9px;border-bottom:2px solid #0f2433}
+.pq-head img{width:124px;height:auto;filter:brightness(0) saturate(100%) invert(13%) sepia(24%)
+  saturate(1420%) hue-rotate(168deg) brightness(94%) contrast(96%)}
+.pq-head .t{margin-left:auto;text-align:right}
+.pq-head h1{margin:0;font-size:15pt;font-weight:600;color:#0f2433;letter-spacing:-.01em}
+.pq-head .sub{font-size:8.6pt;color:#4d5d68;margin-top:1px}
+.pq-meta{display:grid;grid-template-columns:repeat(4,1fr);gap:8px 14px;margin:11px 0 14px;font-size:8.3pt}
+.pq-meta .k{color:#7d8b94;font-size:7pt;letter-spacing:.09em;text-transform:uppercase}
+.pq-meta .v{font-weight:600}
+.pq-figs{position:relative;display:grid;grid-template-columns:repeat(4,1fr);color:#fff;
+  border-radius:6px;overflow:hidden;padding:11px 4px;margin-bottom:16px}
+.pq-figs.c3{grid-template-columns:repeat(3,1fr)}
+.pq-figs.c2{grid-template-columns:repeat(2,1fr)}
+.pq-figs.c1{grid-template-columns:1fr}
+.pq-figs .bg{position:absolute;inset:0;width:100%;height:100%;z-index:0}
+.pq-figs > div{position:relative;z-index:1;padding:0 12px}
+.pq-figs > div + div{border-left:1px solid rgba(255,255,255,.18)}
+.pq-figs .k{font-size:6.8pt;letter-spacing:.12em;text-transform:uppercase;color:#eba380;font-weight:600}
+.pq-figs .v{font-size:15pt;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.pq-figs .n{font-size:7.4pt;color:rgba(255,255,255,.75)}
+.pq h2{font-size:7.6pt;letter-spacing:.13em;text-transform:uppercase;color:#0f2433;margin:14px 0 5px;
+  display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #0f2433;padding-bottom:3px}
+.pq h2 .tot{font-size:9.6pt;letter-spacing:0;font-variant-numeric:tabular-nums}
+.pq-two{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
+.pq-line{display:flex;justify-content:space-between;gap:10px;padding:3.5px 0;border-bottom:1px solid #d6dde2;break-inside:avoid}
+.pq-line .l{flex:1}
+.pq-line .a{font-variant-numeric:tabular-nums;white-space:nowrap}
+.pq-line .q{color:#7d8b94;font-size:8.2pt}
+.pq-line.tot{border-bottom:0;border-top:1.5px solid #0f2433;font-weight:600;padding-top:5px}
+.pq-line.off{color:#7d8b94}
+.pq-line.hint{border:0;padding-top:0}
+.pq-hint{color:#7d8b94;font-size:7.8pt}
+.pq-box{border:1px solid #d6dde2;border-radius:5px;padding:9px 12px;margin-top:12px;background:#f3f6f8}
+.pq-box b{color:#0f2433}
+.pq-notes{border-left:3px solid #eba380;background:#fdf6f2;padding:8px 12px;margin-top:14px;
+  border-radius:0 5px 5px 0;white-space:pre-wrap}
+.pq-notes .k{font-size:7pt;letter-spacing:.1em;text-transform:uppercase;color:#a85f3c;font-weight:600;
+  margin-bottom:2px;white-space:normal}
+.pq-foot{margin-top:auto;padding-top:10px;border-top:1px solid #d6dde2;font-size:7.4pt;color:#7d8b94;
+  display:flex;justify-content:space-between;gap:18px}
+.pq-foot .r{text-align:right;white-space:nowrap}
+
 @media print{
   @page{size:A4 portrait;margin:11mm 10mm 13mm}
   /* Paper is always light, whatever the screen was showing. The report draws its
@@ -2202,19 +2257,34 @@ function csaMessage(adviser, stage, items) {
 
   const expired = items.filter(i => i.expired);
   const rest = items.filter(i => !i.expired);
-  let body = greeting(adviser) + head + "\n\n";
+  /* Blocks joined with one blank line between them, so the spacing is the same
+     whichever of them are present — appending trailing newlines piecemeal left
+     a double gap when only expired agreements remained. */
+  const blocks = [];
   if (expired.length) {
-    body += "Already expired — these are running without a current agreement:\n" +
-      expired.map(line).join("\n") + "\n\n";
+    blocks.push("Already expired, so running without a current agreement:\n" + expired.map(line).join("\n"));
   }
-  if (rest.length) body += (expired.length ? "Also outstanding:\n" : "") + rest.map(line).join("\n") + "\n";
+  if (rest.length) blocks.push((expired.length ? "Also outstanding:\n" : "") + rest.map(line).join("\n"));
+
+  /* What is riding on them: the ongoing fees these clients pay today, from the
+     fee run open when the reminders were queued. A client not in that run has
+     no figure, and saying how many were left out keeps the total honest rather
+     than quietly short. With none priced the line is left out altogether — "$0
+     outstanding" would read as nothing at stake. */
+  const priced = items.filter(i => i.currentFee != null);
+  const unpriced = n - priced.length;
+  const total = priced.length
+    ? "Ongoing fees on " + (one ? "this agreement" : "these agreements") + ": " +
+      money(priced.reduce((a, i) => a + num(i.currentFee), 0)) + " a year" +
+      (unpriced ? " (" + unpriced + " not included — not in this month's fee run)" : "") + "\n\n"
+    : "";
 
   /* Said plainly rather than "ignore this if you have done it": the report is a
      weekly snapshot, so a CSA signed on Tuesday is still on Monday's list, and
      an adviser needs somewhere to put that fact. */
-  body += "\nThis list is rebuilt weekly from Xplan. If " + (one ? "this" : "one of these") +
+  return greeting(adviser) + head + "\n\n" + total + blocks.join("\n\n") + "\n\n" +
+    "This list is rebuilt weekly from Xplan. If " + (one ? "this" : "one of these") +
     " has already been signed, mark it off in the Fee Hub so it stops being chased." + CSA_LINK;
-  return body;
 }
 
 /* Every message the current dump calls for over the next cycle, for everybody.
@@ -3409,10 +3479,28 @@ function calculate(run) {
      supposed to sit in. Null for the open-ended top tier. */
   const bands = categoryBands(rc);
   const catCeil = new Map(bands.map(b => [String(b.c.name).toLowerCase(), b.to]));
-  /* Distinct floors in order, for naming the tier a fee actually lands in.
-     Several names can share a floor; the first alphabetically stands for it. */
-  const tierOrder = [...new Map(bands.map(b => [b.from, { from: b.from, name: b.c.name }])).values()]
+  /* Distinct floors in order, for naming the tier a fee actually lands in — and
+     now for pricing a client in it, since each tier carries its own base fee.
+
+     Several names can share a floor: Xplan's letter codes sit on the same band
+     as the tier they stand for. One has to speak for the band, and since its fee
+     is used, the choice is deliberate rather than an accident of sort order:
+     a name the category mapping points at (so a real tier) beats one that is
+     not, and a word beats a single letter. Ties keep the last alphabetically,
+     which is what this has always shown — so A, B and Private Wealth still read
+     as Private Wealth. */
+  const aliasTargets = new Set(Object.values(rc.aliases || {}).map(s => String(s).toLowerCase()));
+  const speaksFor = c => (aliasTargets.has(String(c.name).toLowerCase()) ? 2 : 0) +
+                         (String(c.name).trim().length > 1 ? 1 : 0);
+  const byFloor = new Map();
+  for (const b of bands) {
+    const held = byFloor.get(b.from);
+    if (!held || speaksFor(b.c) >= speaksFor(held.c)) byFloor.set(b.from, b);
+  }
+  const tierOrder = [...byFloor.values()]
+    .map(b => ({ from: b.from, name: b.c.name, fee: tierFee(b.c) }))
     .sort((a, b) => a.from - b.from);
+  const tierFor = fee => tierOrder.filter(t => fee >= t.from).pop() || null;
   const weightIndex = new Map(rc.entityWeights.map(w => [String(w.name).toLowerCase(), w.weight]));
   const funds = buildFundIndex(priced.funds);
 
@@ -3592,8 +3680,28 @@ function calculate(run) {
     m.aboveTier = m.rateCardFee != null && m.tierCeiling != null && m.rateCardFee > m.tierCeiling;
     m.aboveTierBy = m.aboveTier ? m.rateCardFee - m.tierCeiling : null;
     /* Which tier they would land in on the fee they have now. */
-    m.tierByFee = m.rateCardFee == null ? null
-      : (tierOrder.filter(t => m.rateCardFee >= t.from).pop() || {}).name || null;
+    m.tierByFee = m.rateCardFee == null ? null : ((tierFor(m.rateCardFee) || {}).name || null);
+
+    /* And what they would pay once moved there: the same rate card formula with
+       that tier's base fee in place of their own, under the same floors — never
+       below what they pay today, never below the minimum.
+
+       Moving up can carry a client past the new tier's top as well, if its base
+       fee is enough to push them over. So it steps until the fee stays in the
+       tier it was priced in, and names that one. It only ever steps UP: a tier
+       above with a lower base fee than the one below is a card that needs
+       fixing, not a reason to move somebody down. */
+    m.tierUpFee = null; m.tierUpBase = null;
+    if (m.aboveTier) {
+      let t = tierFor(m.rateCardFee), fee = null;
+      for (let step = 0; t && step <= tierOrder.length; step++) {
+        fee = Math.max(t.fee + m.entityFee + m.surcharge, m.currentFee, rc.absoluteMinimum);
+        const next = tierFor(fee);
+        if (!next || next.from <= t.from) break;
+        t = next;
+      }
+      if (t) { m.tierByFee = t.name; m.tierUpFee = fee; m.tierUpBase = t.fee; }
+    }
 
     const ov = overrides["master:" + m.masterId] || {};
     m.pctInput = ov.pctInput != null ? num(ov.pctInput) : null;                 // AB, when typed over
@@ -4820,12 +4928,18 @@ function clientTable(list, locked) {
           (m.houseSplitApplies ? "FUM under the minimum &mdash; " : "needs direct debit &mdash; ") +
           money(m.splitFunds.reduce((a, r) => a + r.shortfall, 0)) + " by direct debit</span>" : "") +
       (m.mode === "Variable" && m.unsetFunds ? ' <span class="pill warn">' + m.unsetFunds + " fund" + (m.unsetFunds > 1 ? "s" : "") + " unset</span>" : "") +
+      /* The tier they belong in, and what they would pay there — so the pill
+         answers "and what would that mean?" without anybody working it out. The
+         hover carries the sum, in the same terms as the rate card cell. */
       (m.aboveTier ? ' <span class="pill warn" title="' +
           esc("The rate card fee is " + money(m.aboveTierBy) + " above the top of " + (m.mappedTo || m.category) +
-            " (" + money(m.tierCeiling) + ")" +
-            (m.tierByFee ? ". On this fee they sit in " + m.tierByFee + "." : "") +
+            " (" + money(m.tierCeiling) + ")." +
+            (m.tierByFee && m.tierUpFee != null
+              ? " In " + m.tierByFee + " it would be " + money(m.tierUpFee) + ": " + tierUpSum(m) + "."
+              : m.tierByFee ? " On this fee they sit in " + m.tierByFee + "." : "") +
             " Check the category in Xplan.") + '">above tier' +
-          (m.tierByFee ? " &mdash; " + esc(m.tierByFee) : "") + "</span>" : "");
+          (m.tierByFee ? " &mdash; " + esc(m.tierByFee) + (m.tierUpFee != null ? " " + money(m.tierUpFee) : "") : "") +
+          "</span>" : "");
     html += "<tr>" +
       '<td><button class="expand" data-exp="' + esc(m.masterId) + '">' + (open ? "&minus;" : "+") + "</button></td>" +
       /* Three lines, in the order somebody scans them: who, which record, how
@@ -4930,6 +5044,22 @@ function rateCardBreakdown(m) {
   return '<div class="small muted">' +
     (m.rateCardBy === "current" ? "held at current fee" : "raised to the minimum") + "</div>" +
     '<div class="small muted">' + sum + (parts.length > 1 ? " = " + money(m.rateCardFormula) : "") + "</div>";
+}
+
+/* The sum behind the "above tier" fee, in the same words as the rate card
+   cell — and when a floor holds it up instead, says that rather than printing a
+   sum that does not reach the figure. */
+function tierUpSum(m) {
+  if (m.tierUpFee == null) return "";
+  const parts = [m.tierByFee + " " + money(m.tierUpBase)];
+  if (m.entityFee) parts.push("entities " + money(m.entityFee));
+  if (m.surcharge) parts.push("FUM " + money(m.surcharge));
+  const formula = m.tierUpBase + m.entityFee + m.surcharge;
+  return parts.join(" + ") +
+    (m.tierUpFee > formula
+      ? (parts.length > 1 ? " = " + money(formula) : "") + ", held at " +
+        (m.tierUpFee === m.currentFee ? "the current fee" : "the minimum")
+      : "");
 }
 
 /* The client line reports how the client is being priced; it no longer decides
@@ -5227,7 +5357,7 @@ function viewExceptions() {
       body: () => aboveTier.length
         ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Tier</th>' +
           '<th class="num">Top of tier</th><th class="num">Rate card</th><th class="num">Over by</th>' +
-          '<th>Lands in</th></tr></thead><tbody>' +
+          '<th>Lands in</th><th class="num">Fee there</th></tr></thead><tbody>' +
           aboveTier.map(m => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
             "<td>" + esc(m.adviser) + "</td>" +
             "<td>" + esc(m.mappedTo || m.category || "—") +
@@ -5235,6 +5365,9 @@ function viewExceptions() {
             '<td class="num">' + money(m.tierCeiling) + '</td><td class="num">' + money(m.rateCardFee) +
             '</td><td class="num">' + money(m.aboveTierBy) + "</td>" +
             "<td>" + (m.tierByFee ? "<strong>" + esc(m.tierByFee) + "</strong>" : '<span class="muted">—</span>') +
+            '</td><td class="num">' + (m.tierUpFee != null
+              ? "<strong>" + money(m.tierUpFee) + "</strong>" + '<div class="small muted">' + esc(tierUpSum(m)) + "</div>"
+              : '<span class="muted">—</span>') +
             "</td></tr>").join("") + "</tbody></table>" +
           '<div class="spacer"></div><div class="small muted">Nothing here is blocked and no fee is changed. ' +
           "A client outgrowing their tier is normal &mdash; the fix is the category in Xplan, not the fee. Legacy and " +
@@ -5527,8 +5660,9 @@ function approvalDetail(adviser, ms) {
 /* =========================================================================
    Pricing calculator
    Quotes a new or existing client off the internal pricing sheet, and prices an
-   insurance claim. It reads pricing and writes nothing: no client is named, no
-   quote is saved, and every figure is gone when the tab closes.
+   insurance claim. It reads pricing and writes nothing: no quote is saved, and
+   every figure is gone when the tab closes. A client is named only on the PDF
+   report, typed in at the moment of printing — see buildAdviceReport().
    ========================================================================= */
 
 const pricing = () => (state.rateCard && state.rateCard.pricing) || EMPTY_PRICING;
@@ -5923,7 +6057,9 @@ function viewPricing() {
       "</div>";
   }
   html += '<div class="toggle-row no-print" style="margin-bottom:16px">' +
-    pricingTabBtn("advice", "Advice fees") + pricingTabBtn("claims", "Insurance claims") + "</div>";
+    pricingTabBtn("advice", "Advice fees") + pricingTabBtn("claims", "Insurance claims") +
+    /* One report per tab: whichever is showing is what gets printed. */
+    '<button class="btn ghost" id="btnPricingReport" style="margin-left:auto">Report / PDF</button></div>';
   return html + (pricingInputs.tab === "claims" ? pricingClaimsView(p) : pricingAdviceView(p));
 }
 
@@ -6212,6 +6348,242 @@ function pricingReference(p) {
     list.map(r => '<div><div style="font-weight:600;margin-bottom:6px">' + esc(r.title) + "</div>" +
       '<div class="small muted" style="white-space:pre-line">' + esc(r.body) + "</div></div>").join("") +
     "</div>") + "</div>";
+}
+
+/* =========================================================================
+   The Pricing Calculator report
+   What is on screen, on one page, to go on file and sometimes to the client.
+
+   The calculator still saves nothing. The client's name, Xplan id and the notes
+   are asked for at the moment of printing, go onto the page, and are gone when
+   the print dialog closes — the PDF is the only record, which is the point.
+   ========================================================================= */
+
+/* $500k, $1.25m — band edges read at a glance, not as six-digit numbers. */
+function shortMoney(n) {
+  n = num(n);
+  const trim = v => String(+v.toFixed(2));
+  if (n >= 1e6) return "$" + trim(n / 1e6) + "m";
+  if (n >= 1e3) return "$" + trim(n / 1e3) + "k";
+  return money(n);
+}
+/* Two decimals, the way the calculator screen shows a band's rate. */
+const bandPct = r => (num(r) * 100).toFixed(2) + "%";
+
+/* The bands a figure actually reached, as one line of small print. Bands at a
+   rate of nothing are left out — they are the stretch a minimum already covers,
+   and listing them makes the arithmetic look longer than it is. */
+function bandHint(bands, value) {
+  const parts = [];
+  bands.forEach((b, i) => {
+    const to = i + 1 < bands.length ? bands[i + 1].from : null;
+    const slice = Math.min(Math.max(value - b.from, 0), to === null ? Infinity : to - b.from);
+    if (!(slice > 0) || !(b.rate > 0)) return;
+    const top = to === null || value < to ? value : to;
+    parts.push((b.from ? shortMoney(b.from) : "up to") + "–" + shortMoney(top) + " at " + bandPct(b.rate) +
+      " = " + money(slice * b.rate));
+  });
+  return parts.join(" · ").replace(/^up to–/, "to ");
+}
+
+/* A reference that ties a PDF on file back to a moment. Not stored anywhere —
+   it exists to be quoted, "see PC-261112-4F7A", by whoever has the paper. */
+function pricingRef() {
+  const d = new Date();
+  const ymd = String(d.getFullYear()).slice(2) + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+  const r = new Uint8Array(2);
+  (window.crypto || window.msCrypto).getRandomValues(r);
+  return "PC-" + ymd + "-" + [...r].map(x => x.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+const pqLine = (label, amount, opts = {}) =>
+  '<div class="pq-line' + (opts.cls ? " " + opts.cls : "") + '"><span class="l">' + label +
+  (opts.q ? ' <span class="q">' + opts.q + "</span>" : "") + '</span><span class="a">' + (amount == null ? "" : amount) + "</span></div>";
+const pqHint = text => text ? '<div class="pq-line hint"><span class="l pq-hint">' + esc(text) + "</span></div>" : "";
+const pqFig = (k, v, n) => '<div><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div><div class="n">' + esc(n || "") + "</div></div>";
+/* The band behind the figures, as an image so it prints with or without
+   background graphics. */
+const pqFigs = cells => '<div class="pq-figs c' + cells.length + '">' +
+  '<svg class="bg" viewBox="0 0 10 10" preserveAspectRatio="none" aria-hidden="true"><rect width="10" height="10" fill="#0f2433"/></svg>' +
+  cells.join("") + "</div>";
+
+function pqShell(title, who, meta, bodyHtml, footText, ref) {
+  return '<div class="pq">' +
+    '<div class="pq-head"><img src="' + esc(logoSrc()) + '" alt="Coastal Advisory Australia">' +
+    '<div class="t"><h1>' + esc(title) + '</h1><div class="sub">' + esc(who) + "</div></div></div>" +
+    '<div class="pq-meta">' + meta.map(([k, v]) => '<div><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div></div>").join("") + "</div>" +
+    bodyHtml +
+    '<div class="pq-foot"><div>' + footText + '</div><div class="r">Ref ' + esc(ref) + "</div></div>" +
+    "</div>";
+}
+
+const pqNotes = notes => String(notes || "").trim()
+  ? '<div class="pq-notes"><div class="k">Notes</div>' + esc(String(notes).trim()) + "</div>" : "";
+
+function pricingReviewedLine() {
+  const r = pricing().reviewed;
+  return r ? "Prepared using Coastal Advisory's pricing reviewed " + esc(r) + "." : "";
+}
+
+/* ---- advice fees ---- */
+function buildAdviceReport(info) {
+  const a = priceAdvice();
+  const ct = pricingInputs.clientType;
+  const used = sec => a.items.filter(i => i.section === sec);
+  /* A line is on the report if it carries an amount — or if it is a "once"
+     fee that an insurance-only line switched off, which is worth seeing on
+     paper as not charged rather than silently missing. */
+  const lineOf = (i, prefix) => {
+    if (i.na) return "";
+    if (i.kind === "min" && i.suppressed) {
+      return pqLine(esc((prefix || "") + i.label), "—", { cls: "off", q: "not charged" });
+    }
+    const amt = lineAmount(i);
+    if (amt == null) return "";
+    const per = { hour: " hr", year: "" }[i.kind];
+    const q = i.kind === "min" ? "" : "× " + (+num(i.qty).toFixed(2)) + (i.kind === "hour" ? (num(i.qty) === 1 ? " hr" : " hrs") : "");
+    return pqLine(esc((prefix || "") + i.label), money(amt) + (i.kind === "year" ? " /yr" : ""), { q: esc(q) });
+  };
+
+  const upfront = used("soa").map(i => lineOf(i, "SOA — ")).join("") + used("impl").map(i => lineOf(i)).join("");
+  let ongoing = used("csa").map(i => lineOf(i)).join("");
+  if (a.ladder.length && a.fum > 0) {
+    ongoing += pqLine("FUM fee", money(a.fumFee), { q: "on " + money(a.fum) }) + pqHint(bandHint(a.ladder, a.fum));
+  }
+
+  /* Everything that is priced but sits outside both totals: hourly work,
+     Centrelink administration, and Coastal's other services. */
+  let separate = used("hourly").map(i => lineOf(i)).join("");
+  if (a.centrelink != null && a.centrelink > 0) {
+    const basis = pricingInputs.onAgreement ? (a.pack ? a.pack.name + " package" : "") : "no Service Agreement";
+    separate += pqLine("Centrelink administration", money(a.centrelink),
+      { q: esc(basis + (pricingInputs.meansTested ? ", means tested" : "")) });
+  }
+  separate += a.items.filter(i => i.section === ANCILLARY).map(i => lineOf(i)).join("");
+
+  const body =
+    pqFigs([
+      pqFig("Upfront", money(a.upfront), "SOA and implementation"),
+      pqFig("Ongoing", money(a.ongoing), "per year"),
+      pqFig("Fee as % of FUM", a.pctOfFum == null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%", a.fum > 0 ? "on " + money(a.fum) : "no FUM entered"),
+      pqFig("Service package", a.pack ? a.pack.name : "—", a.pack && num(a.pack.from) > 0 ? "from " + money(num(a.pack.from)) + " ongoing" : "")
+    ]) +
+    '<div class="pq-two"><div>' +
+      '<h2>Upfront <span class="tot">' + money(a.upfront) + "</span></h2>" +
+      (upfront || pqLine('<span class="pq-hint">Nothing upfront</span>', "")) +
+      pqLine("Total upfront", money(a.upfront), { cls: "tot" }) +
+    "</div><div>" +
+      '<h2>Ongoing, per year <span class="tot">' + money(a.ongoing) + "</span></h2>" +
+      (ongoing || pqLine('<span class="pq-hint">Nothing ongoing</span>', "")) +
+      pqLine("Total ongoing", money(a.ongoing), { cls: "tot" }) +
+    "</div></div>" +
+    (separate
+      ? "<h2>Payable separately <span class=\"tot\"></span></h2>" + separate +
+        '<div class="pq-hint" style="margin-top:4px">Not included in the upfront or ongoing totals above.' +
+        (a.centrelink > 0 ? " Centrelink administration is paid by direct debit or invoice and sits outside the Client Service Agreement." : "") +
+        "</div>"
+      : "") +
+    pqNotes(info.notes);
+
+  return pqShell("Advice Fee Summary", info.client,
+    [["Xplan ID", info.xplan || "—"], ["Client type", ct === "NEW" ? "New" : "Existing"],
+     ["Prepared by", info.by], ["Date", info.when]],
+    body,
+    "All fees include GST. " + pricingReviewedLine() +
+      " Final fees are confirmed in the Statement of Advice and Client Service Agreement.",
+    info.ref);
+}
+
+/* ---- insurance claims ---- */
+function buildClaimsReport(info) {
+  const c = priceClaim();
+  const hasTpd = c.benefit > 0 && c.tiers.length;
+  const hasHours = num(pricingInputs.totalHours) > 0;
+  const discPct = Math.round(c.disc * 100) + "%";
+
+  const figs = [];
+  if (hasTpd || !hasHours) figs.push(pqFig("TPD lump sum fee", money(c.lumpNet),
+    c.capped ? "commissions cover the fee" : (c.commsApplied || c.disc ? "after commissions" + (c.disc ? " and discount" : "") : "on the insured benefit")));
+  if (hasHours || !hasTpd) figs.push(pqFig("Hourly fee", money(c.hoursNet),
+    c.billable ? c.billable + " billable hour" + (c.billable === 1 ? "" : "s") + (c.disc ? ", after discount" : "") : "no hours entered"));
+  if (c.ipOngoing) figs.push(pqFig("IP claim management", money(c.ipMonthly), "per month, once a claim is paid"));
+
+  let tpd = "";
+  if (hasTpd) {
+    tpd = "<div><h2>TPD — lump sum <span class=\"tot\">" + money(c.lumpNet) + "</span></h2>" +
+      pqLine("Fee on " + money(c.benefit) + " benefit", money(c.tierFee)) +
+      pqHint(bandHint(c.tiers, c.benefit)) +
+      (c.commsApplied ? pqLine("Less commissions, last 12 months", "−" + money(c.commsApplied),
+        { q: c.capped ? "reduces the fee to nil" : "" }) : "") +
+      (c.disc && c.lump ? pqLine("Less multi-claim discount", "−" + money(c.lump * c.disc), { q: discPct }) : "") +
+      pqLine("TPD fee", money(c.lumpNet), { cls: "tot" }) + "</div>";
+  }
+  let hours = "";
+  if (hasHours) {
+    const comp = num(pricingInputs.compHours);
+    hours = "<div><h2>Hourly <span class=\"tot\">" + money(c.hoursNet) + "</span></h2>" +
+      pqLine("Hours worked", String(+num(pricingInputs.totalHours).toFixed(2))) +
+      (comp ? pqLine("Less complimentary", "−" + (+comp.toFixed(2))) : "") +
+      pqLine(c.billable + " hour" + (c.billable === 1 ? "" : "s") + " at " + money(c.rate), money(c.hoursFee),
+        { q: c.rateRow ? esc(String(c.rateRow.label).split(/\s+[—-]\s+/)[0].toLowerCase()) : "" }) +
+      (c.disc && c.hoursFee ? pqLine("Less multi-claim discount", "−" + money(c.hoursFee * c.disc), { q: discPct }) : "") +
+      pqLine("Hourly fee", money(c.hoursNet), { cls: "tot" }) + "</div>";
+  }
+
+  const body = pqFigs(figs) +
+    (tpd && hours ? '<div class="pq-two">' + tpd + hours + "</div>" : tpd + hours) +
+    (c.ipOngoing
+      ? '<div class="pq-box"><b>Income protection claim management: ' + money(c.ipMonthly) + " per month</b>, once the " +
+        "claim is paid." + (c.disc ? " This is an ongoing charge, so the multi-claim discount does not apply to it." : "") + "</div>"
+      : "") +
+    pqNotes(info.notes);
+
+  const rateLabel = c.rateRow ? String(c.rateRow.label).split(/\s+[—-]\s+/)[0] : "—";
+  return pqShell("Insurance Claim Fee Summary", info.client,
+    [["Xplan ID", info.xplan || "—"], ["Rate", rateLabel], ["Prepared by", info.by], ["Date", info.when]],
+    body,
+    "All fees include GST. The fees charged are governed by the Insurance Claims Letter of Engagement. " +
+      pricingReviewedLine(),
+    info.ref);
+}
+
+/* Asks for what the page needs and the calculator does not keep. The client's
+   name is required — a report on file that does not say whose it is cannot be
+   found again, which defeats the reason for printing it. */
+function openPricingReport() {
+  const claims = pricingInputs.tab === "claims";
+  showDialog(claims ? "Insurance claim report" : "Advice fee report",
+    '<div class="field"><label>Client name</label><input type="text" id="pqClient" placeholder="Citizen, Jane &amp; John" autocomplete="off"></div>' +
+    '<div class="field"><label>Xplan ID <span class="small muted">(optional)</span></label><input type="text" id="pqXplan" autocomplete="off"></div>' +
+    '<div class="field"><label>Notes <span class="small muted">(optional, printed on the report)</span></label>' +
+      '<textarea id="pqNotes" rows="3" style="width:100%" placeholder="Why this pricing — for whoever reads the file later"></textarea></div>' +
+    '<div class="small muted" style="margin-top:10px">Opens your browser\'s print dialog &mdash; choose <strong>Save as PDF</strong> ' +
+    "to keep a copy. Nothing typed here is saved by the Fee Hub; the PDF is the record.</div>",
+    "Create report", () => {
+      const client = (($("#pqClient") || {}).value || "").trim();
+      if (!client) { toast("Add the client's name — it is what the report is filed under.", "bad"); return false; }
+      const id = state.identity;
+      const info = {
+        client,
+        xplan: (($("#pqXplan") || {}).value || "").trim(),
+        notes: ($("#pqNotes") || {}).value || "",
+        by: (id && id.name) || state.asAdviser || "—",
+        when: new Date().toLocaleString("en-AU", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" }),
+        ref: pricingRef()
+      };
+      printPricingReport(claims ? buildClaimsReport(info) : buildAdviceReport(info));
+      return true;
+    });
+}
+
+/* The same hand-off the review report uses — into #report, flag the body so the
+   print stylesheet sends that instead of the screen, and take it all back down
+   when printing finishes. */
+function printPricingReport(html) {
+  $("#report").innerHTML = html;
+  document.body.classList.add("printing");
+  try { window.print(); }
+  finally { setTimeout(endPrint, 60000); }
 }
 
 /* Repaints every computed figure without rebuilding the screen, so typing in a
@@ -7488,6 +7860,7 @@ function wire() {
      no one is typing when it happens. */
   document.querySelectorAll("[data-ptab]").forEach(el =>
     el.addEventListener("click", () => { pricingInputs.tab = el.dataset.ptab; render(); }));
+  if ($("#btnPricingReport")) $("#btnPricingReport").addEventListener("click", openPricingReport);
   document.querySelectorAll("[data-ptype]").forEach(el =>
     el.addEventListener("click", () => { pricingInputs.clientType = el.dataset.ptype; render(); }));
   document.querySelectorAll("[data-pq]").forEach(el =>
