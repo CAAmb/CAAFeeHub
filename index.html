@@ -459,7 +459,16 @@ td input.num{text-align:right}
 .rowsec{margin-bottom:26px}
 .rowsec:last-child{margin-bottom:0}
 .rowsec-h{display:flex;align-items:baseline;gap:12px;padding-bottom:7px;border-bottom:2px solid var(--navy)}
-.rowsec-h .t{font-size:.66rem;letter-spacing:.13em;text-transform:uppercase;font-weight:700}
+.rowsec-h .t{font-size:.76rem;letter-spacing:.11em;text-transform:uppercase;font-weight:700}
+/* The three groups a quote is made of — what is paid once, what is paid every
+   year, and what is paid outside both. Big enough that nobody reads an
+   implementation line as part of the ongoing fee. */
+.rowgrp{display:flex;align-items:baseline;gap:12px;margin:2px 0 14px;padding-left:12px;
+  border-left:4px solid var(--peach)}
+.rowgrp:not(:first-child){margin-top:38px}
+.rowgrp .t{font-size:1.3rem;font-weight:700;letter-spacing:-.01em}
+.rowgrp .n{font-size:.8rem;color:var(--ink-muted)}
+.rowgrp .tot{margin-left:auto;font-size:1.3rem;font-weight:700;font-variant-numeric:tabular-nums}
 .rowsec-h .tot{margin-left:auto;font-size:.95rem;font-weight:600;font-variant-numeric:tabular-nums}
 .rrow{display:flex;align-items:center;gap:14px;padding:9px 2px;border-bottom:1px solid var(--line)}
 .rrow .lbl{flex:1;min-width:0;font-size:.9rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -601,9 +610,12 @@ td input.num{text-align:right}
 .pq-figs .k{font-size:6.8pt;letter-spacing:.12em;text-transform:uppercase;color:#eba380;font-weight:600}
 .pq-figs .v{font-size:15pt;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
 .pq-figs .n{font-size:7.4pt;color:rgba(255,255,255,.75)}
-.pq h2{font-size:7.6pt;letter-spacing:.13em;text-transform:uppercase;color:#0f2433;margin:14px 0 5px;
-  display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #0f2433;padding-bottom:3px}
-.pq h2 .tot{font-size:9.6pt;letter-spacing:0;font-variant-numeric:tabular-nums}
+/* Section headings sized to be read first, so Upfront and Ongoing cannot be
+   mistaken for each other at a glance. Still capitals and a rule, kept quiet in
+   colour — the figures are what should stand out. */
+.pq h2{font-size:10pt;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#0f2433;margin:16px 0 6px;
+  display:flex;justify-content:space-between;align-items:baseline;border-bottom:1.5px solid #0f2433;padding-bottom:4px}
+.pq h2 .tot{font-size:11.5pt;letter-spacing:0;font-variant-numeric:tabular-nums}
 .pq-two{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
 .pq-line{display:flex;justify-content:space-between;gap:10px;padding:3.5px 0;border-bottom:1px solid #d6dde2;break-inside:avoid}
 .pq-line .l{flex:1}
@@ -795,6 +807,11 @@ const ROLES = ["Adviser", "Ops", "Manager", "Admin"];
 const REGIONS = ["Northern", "Southern"];
 const REGION_ALL = "All regions";
 const REGION_NONE = "—";
+/* What a client's region reads when their adviser cannot supply one — each is
+   a different fix, so each is named. */
+const REGION_NOT_IN_PEOPLE = "Adviser not in People";
+const REGION_INACTIVE = "Adviser inactive";
+const REGION_UNSET = "No region set";
 
 /* Where a fund's fee is drawn from. The split exists because a platform can
    refuse to carry the whole fee — under its minimum balance it carries none,
@@ -952,9 +969,11 @@ const EMPTY_PRICING = {
   /* Marginal FUM bands, one ladder per client type, in the same {from, rate}
      shape the surcharge bands use so surchargeFor() prices both. */
   ladders: { NEW: [], EXISTING: [] },
-  /* Service tiers, chosen by total ongoing fee. `from` is the threshold; the
-     next package's threshold is the top of this one, so they cannot disagree.
-     cas/mtf are the Centrelink admin fees for a client on that package. */
+  /* Service tiers. A client's package is the one in the same position as the
+     FUM band they fall in, on their client type's ladder. `from` is the
+     package FEE — the least the ongoing fee can be in it — kept under its old
+     name because the stored figures were already the fees. cas/mtf are the
+     Centrelink admin fees for a client on that package. See priceAdvice(). */
   packages: [],                       // { name, from, cas, mtf }
   noCsa: { cas: 0, mtf: 0 },          // the same two fees for a client with no agreement
   claims: {
@@ -1141,6 +1160,11 @@ const state = {
      outlive the dump it was made against. It holds no client names. */
   csaStatus: {},
   csaFilter: "open",      // "open" | "expired" | "marked" | "all"
+  /* Its own filters rather than Review's, so narrowing one screen to an adviser
+     does not quietly narrow the other. */
+  csaAdviser: "all",
+  csaRegion: "all",
+  csaQuery: "",
   csaOpen: {},            // which exception blocks are showing
   navCollapsed: null,     // null = follow the viewport, true/false = pinned by the user
   theme: "system",        // "system" | "light" | "dark"
@@ -1553,7 +1577,10 @@ function explainFetchFailure(e) {
 
 function adviserFromRow(f) {
   return {
-    name: String(f.Title || ""),
+    /* Trimmed, because the Xplan names it is matched against are, and a trailing
+       space typed into SharePoint is invisible there but makes "Kirk, Janelle "
+       a different person — no region on Review, an empty My Clients. */
+    name: String(f.Title || "").trim(),
     role: ROLES.includes(f.AccessRole) ? f.AccessRole : "Adviser",
     region: String(f.Region || ""),
     email: String(f.Email || ""),
@@ -2250,8 +2277,13 @@ function csaMessage(adviser, stage, items) {
     weekly:  what + are + " still outstanding."
   }[stage] || what + (one ? " needs" : " need") + " attention.";
 
+  /* Each client carries their own fee — what they pay today, from the fee run
+     open when the reminders were queued — so the adviser can see which
+     agreement is worth chasing first. A client not in that run has no figure
+     and simply goes without one, rather than reading "$0". */
   const line = i => "  · " + i.client +
     (i.tier ? " (" + i.tier + ")" : "") +
+    (i.currentFee != null ? " — " + money(i.currentFee) + " a year" : "") +
     (i.expired ? " — agreement expired " + dayLabel(i.csaEnd) + ", " + i.expiredDays + " days ago"
                : i.csaEnd ? " — agreement ends " + dayLabel(i.csaEnd) : "");
 
@@ -2266,23 +2298,10 @@ function csaMessage(adviser, stage, items) {
   }
   if (rest.length) blocks.push((expired.length ? "Also outstanding:\n" : "") + rest.map(line).join("\n"));
 
-  /* What is riding on them: the ongoing fees these clients pay today, from the
-     fee run open when the reminders were queued. A client not in that run has
-     no figure, and saying how many were left out keeps the total honest rather
-     than quietly short. With none priced the line is left out altogether — "$0
-     outstanding" would read as nothing at stake. */
-  const priced = items.filter(i => i.currentFee != null);
-  const unpriced = n - priced.length;
-  const total = priced.length
-    ? "Ongoing fees on " + (one ? "this agreement" : "these agreements") + ": " +
-      money(priced.reduce((a, i) => a + num(i.currentFee), 0)) + " a year" +
-      (unpriced ? " (" + unpriced + " not included — not in this month's fee run)" : "") + "\n\n"
-    : "";
-
   /* Said plainly rather than "ignore this if you have done it": the report is a
      weekly snapshot, so a CSA signed on Tuesday is still on Monday's list, and
      an adviser needs somewhere to put that fact. */
-  return greeting(adviser) + head + "\n\n" + total + blocks.join("\n\n") + "\n\n" +
+  return greeting(adviser) + head + "\n\n" + blocks.join("\n\n") + "\n\n" +
     "This list is rebuilt weekly from Xplan. If " + (one ? "this" : "one of these") +
     " has already been signed, mark it off in the Fee Hub so it stops being chased." + CSA_LINK;
 }
@@ -3637,7 +3656,12 @@ function calculate(run) {
     m.includedCount = m.rows.filter(r => r.included).length;
 
     const adv = advIndex.get(m.adviser);
-    m.region = adv && adv.active ? adv.region : "—";
+    /* Says why there is no region rather than printing a dash, because a dash
+       sent somebody to People to find every adviser's region already set there —
+       the cause was the match, not the region. */
+    m.region = !adv ? REGION_NOT_IN_PEOPLE
+      : adv.active === false ? REGION_INACTIVE
+      : (adv.region && adv.region !== REGION_NONE) ? adv.region : REGION_UNSET;
     if (!adv) unknownAdvisers.add(m.adviser);
 
     m.entityWeightTotal = entityTotal.get(m.masterId) || 0;                     // AH
@@ -4346,7 +4370,7 @@ async function startSession() {
     state.role = id.role;
     /* An adviser is only ever themselves, and Title is what Xplan calls them —
        which is the name their clients are filed under. */
-    state.asAdviser = id.role === "Adviser" && id.row ? String(id.row.Title || "") : null;
+    state.asAdviser = id.role === "Adviser" && id.row ? String(id.row.Title || "").trim() : null;
 
     /* Client records have no business sitting in a browser profile on a shared
        machine once the site is the source of truth. */
@@ -4736,7 +4760,9 @@ function viewReview() {
   if (can("ownBook")) return viewMyClients();
 
   const advisers = advisersInRun();
-  const regions = [...new Set(c.masters.map(m => m.region))].sort();
+  /* The regions always, so the list is never just a dash — then whatever else
+     the clients turned up, which is only ever a reason a region is missing. */
+  const regions = REGIONS.concat([...new Set(c.masters.map(m => m.region))].filter(r => !REGIONS.includes(r)).sort());
   const locked = run.status === "Locked" || run.status === "Sent";
 
   let list = c.masters;
@@ -5723,8 +5749,49 @@ function priceAdvice() {
     i.amount = i.na || i.suppressed ? 0 : (i.kind === "min" ? i.price : i.qty * i.price);
   }
 
+  const ladder = ((p.ladders || {})[ct] || []).map(b => ({ from: num(b.from), rate: num(b.rate) }));
+  const fum = num(pricingInputs.fum);
+  const fumFee = ladder.length ? surchargeFor(fum, ladder) : 0;
+
+  /* The service package follows the client's FUM: the Nth band of their FUM
+     ladder is the Nth package, lowest first — so an existing client with
+     $532,009 sits in the second band ($300k–$1m) and is Essential. The ladder
+     is the client type's own, so the same balance can be a different package
+     for a new client and an existing one, exactly as the bands differ.
+
+     Each package's `from` is its FEE — the least its ongoing fee can be. It
+     used to be the ongoing-fee threshold that chose the package (the original
+     sheet did that too), which left an Essential client priced at the $3,600
+     minimum. The figures were already the fees, so no data had to move.
+
+     With no ladder for the client type there are no bands to read, and it
+     falls back to choosing by fee as before rather than guessing. */
+  const packs = [...(p.packages || [])].sort((a, b) => num(a.from) - num(b.from));
+  let pack = null, packBand = null;
+  if (packs.length && ladder.length) {
+    /* Strictly above: the ladder reads "FUM above", the sheet's first band is
+       "$0 to $300K inclusive", and the FUM fee itself only starts on the dollar
+       past the edge — so $300,000 exactly is still the first package. */
+    let band = 0;
+    ladder.forEach((b, n) => { if (n === 0 || fum > b.from) band = n; });
+    pack = packs[Math.min(band, packs.length - 1)];
+    packBand = { from: ladder[band].from, to: band + 1 < ladder.length ? ladder[band + 1].from : null };
+  }
+
+  /* The package fee stands in for the Individual & Partner minimum when it is
+     the larger — Essential's $5,500 replaces an existing client's $3,600.
+     Additional people, trusts, SMSFs and the FUM fee still add on top, the same
+     shape as the review's tier base fee. A new client's minimum already
+     matches Essential, so nothing changes for them there. */
+  const minLines = items.filter(i => i.section === "csa" && i.kind === "min" && !i.na && !i.suppressed);
+  const minTotal = minLines.reduce((a, i) => a + i.amount, 0);
+  const packFee = pack ? num(pack.from) : 0;
+  const packLift = !!pack && packFee > minTotal;
+  if (packLift) for (const i of minLines) { i.replaced = true; i.amount = 0; }
+  const packAmount = packLift ? packFee : 0;
+
   const sum = s => items.filter(i => i.section === s).reduce((a, i) => a + i.amount, 0);
-  const soa = sum("soa"), impl = sum("impl"), csa = sum("csa"), hourly = sum("hourly");
+  const soa = sum("soa"), impl = sum("impl"), csa = sum("csa") + packAmount, hourly = sum("hourly");
 
   /* Ancillary splits by how often it is charged rather than by section, because
      a one-off lending fee and an annual accounting retainer are two different
@@ -5738,18 +5805,13 @@ function priceAdvice() {
   const ancOnce = ancSum(false), ancYear = ancSum(true);
   const ancSet = items.some(i => i.section === ANCILLARY);
 
-  const ladder = ((p.ladders || {})[ct] || []).map(b => ({ from: num(b.from), rate: num(b.rate) }));
-  const fum = num(pricingInputs.fum);
-  const fumFee = ladder.length ? surchargeFor(fum, ladder) : 0;
-
   const ongoing = csa + fumFee;
   const upfront = soa + impl;
 
-  /* The service tier a client lands in is decided by the ongoing fee, not by
-     what they hold — a small balance on a lot of entities still climbs. */
-  const packs = [...(p.packages || [])].sort((a, b) => num(a.from) - num(b.from));
-  let pack = null;
-  for (const k of packs) if (ongoing >= num(k.from)) pack = k;
+  /* No ladder, so no bands: choose by ongoing fee, as the sheet did. */
+  if (!pack && packs.length && !ladder.length) {
+    for (const k of packs) if (ongoing >= num(k.from)) pack = k;
+  }
 
   /* Centrelink admin sits outside the agreement and is invoiced or direct
      debited, so it is never rolled into either total. */
@@ -5757,7 +5819,8 @@ function priceAdvice() {
   const centrelink = src ? num(pricingInputs.meansTested ? src.mtf : src.cas) : null;
 
   return { items, soa, impl, csa, hourly, ladder, fum, fumFee, ongoing, upfront,
-           pack, centrelink, packs, ancOnce, ancYear, ancSet,
+           pack, packBand, packFee, packLift, packAmount, minTotal,
+           centrelink, packs, ancOnce, ancYear, ancSet,
            pctOfFum: fum > 0 ? ongoing / fum : null };
 }
 
@@ -5817,6 +5880,14 @@ const pricingTabBtn = (id, label) =>
    The weekly Incomplete task report, with the two fee figures joined on from
    the current run, the ageing worked out, and a way to take one off the chase.
    ========================================================================= */
+
+/* A CSA's region for filtering: the adviser's region in People, the same place
+   Review gets it from — falling back to the queue the Xplan task sits in
+   ("CSA, North") when the adviser has no row there. */
+function csaRegionOf(i) {
+  const a = adviserRow(i.adviser);
+  return (a && a.region && a.region !== REGION_NONE && a.region !== REGION_ALL) ? a.region : (i.region || REGION_UNSET);
+}
 
 /* An adviser may tick off their own; Advice Operations and above, anybody's. */
 const csaCanMark = i => can("csaLoad") ||
@@ -5954,7 +6025,31 @@ function viewCsa() {
         : "Advice Operations load this each week.") + "</div>";
   }
 
-  const mine = csaVisible(csa.items);
+  /* What this person may see, then what they have narrowed it to. Advisers see
+     their own and get no filters; everybody else gets the same three as Review.
+     The figures across the top follow the filters, so picking an adviser shows
+     their value at risk rather than the firm's. */
+  const scoped = csaVisible(csa.items);
+  let mine = scoped;
+  let filterBar = "";
+  if (!can("ownBook")) {
+    const advOpts = [...new Set(scoped.map(i => i.adviser).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    const regOpts = REGIONS.concat([...new Set(scoped.map(csaRegionOf))].filter(r => r && !REGIONS.includes(r)).sort());
+    if (state.csaAdviser !== "all" && !advOpts.includes(state.csaAdviser)) state.csaAdviser = "all";
+    if (state.csaAdviser !== "all") mine = mine.filter(i => i.adviser === state.csaAdviser);
+    if (state.csaRegion !== "all") mine = mine.filter(i => csaRegionOf(i) === state.csaRegion);
+    const q = state.csaQuery.trim().toLowerCase();
+    if (q) mine = mine.filter(i => [i.client, i.entityId, i.adviser].some(v => String(v || "").toLowerCase().includes(q)));
+    const opt = (v, cur) => '<option value="' + esc(v) + '"' + (cur === v ? " selected" : "") + ">" + esc(v) + "</option>";
+    filterBar = '<div class="card no-print" style="margin-bottom:16px"><div class="card-h">' +
+      '<div class="field" style="min-width:210px"><label>Adviser</label><select id="csaAdv"><option value="all">All advisers</option>' +
+        advOpts.map(a => opt(a, state.csaAdviser)).join("") + "</select></div>" +
+      '<div class="field" style="min-width:150px"><label>Region</label><select id="csaReg"><option value="all">All regions</option>' +
+        regOpts.map(r => opt(r, state.csaRegion)).join("") + "</select></div>" +
+      '<div class="field" style="min-width:220px"><label>Find a client</label>' +
+        '<input type="search" id="csaQ" placeholder="name or Xplan ID" value="' + esc(state.csaQuery) + '"></div>' +
+      "</div></div>";
+  }
   const liveMine = mine.filter(i => !i.suppressed);
   const expiredMine = liveMine.filter(i => i.expired);
   const soonMine = liveMine.filter(i => i.stage === "soon" || i.stage === "due");
@@ -5987,7 +6082,7 @@ function viewCsa() {
       "chased for another " + CSA_DISPUTE_GRACE_DAYS + " days, then they go back on the list.</div>";
   }
 
-  html += '<div class="stats">' +
+  html += filterBar + '<div class="stats">' +
     stat("Outstanding", String(liveMine.length), csa.takenAt ? "as at " + dayLabel(csa.takenAt.slice(0, 10)) : "") +
     stat("Value at risk", money(atRisk),
          unpriced ? unpriced + " not priced" : "current ongoing fees") +
@@ -6068,9 +6163,51 @@ function viewPricing() {
    priced at zero that somebody actually entered still shows $0, because that is
    a real answer. */
 const lineAmount = it => it.na ? null
-  : it.kind === "min" ? (it.suppressed ? null : it.amount)
+  : it.kind === "min" ? (it.suppressed || it.replaced ? null : it.amount)
   : (it.qty > 0 ? it.amount : null);
 const amt = v => v === null ? "&mdash;" : money(v);
+/* The FUM band a package covers for one client type, read off that type's
+   ladder by the package's position — the same pairing priceAdvice() uses. */
+function packageBandText(p, pack, ct) {
+  const packs = [...(p.packages || [])].sort((a, b) => num(a.from) - num(b.from));
+  const ladder = [...(((p.ladders || {})[ct]) || [])].map(b => num(b.from)).sort((a, b) => a - b);
+  if (!ladder.length) return "no bands — by fee";
+  const pos = packs.indexOf(pack);
+  if (pos < 0) return "";
+  if (pos >= ladder.length) return "never reached";
+  const from = ladder[pos], to = pos + 1 < ladder.length ? ladder[pos + 1] : null;
+  /* The top package also takes every band beyond the last package. */
+  const open = to == null || pos === packs.length - 1;
+  return open ? shortMoney(from) + " and above" : (from ? shortMoney(from) : "$0") + " – " + shortMoney(to);
+}
+
+/* Packages and bands pair off by position, so a different count of each means
+   some band has no package of its own, or some package can never be reached. */
+function packBandMismatch(p) {
+  const n = (p.packages || []).length;
+  const off = ["NEW", "EXISTING"].filter(ct => ((p.ladders || {})[ct] || []).length && ((p.ladders || {})[ct] || []).length !== n);
+  return off.length ? n + " packages, but " + off.map(ct => ((p.ladders || {})[ct] || []).length + " " + ct + " bands").join(" and ") : "";
+}
+
+/* Under the Service package card: which FUM band put them there, and what the
+   package costs at least — the two things that explain the ongoing figure. */
+function packCardNote(a) {
+  if (!a.pack) return "set by FUM";
+  const band = packBandLabel(a);
+  const fee = num(a.pack.from) > 0 ? "from " + money(num(a.pack.from)) : "";
+  return [band, fee].filter(Boolean).join(" · ") || "set by the ongoing fee";
+}
+
+/* "FUM $300k–$1m" — the band that put the client in their package. */
+function packBandLabel(a) {
+  if (!a.packBand) return "";
+  const b = a.packBand;
+  return "FUM " + (b.to == null ? shortMoney(b.from) + "+" : (b.from ? shortMoney(b.from) : "$0") + "–" + shortMoney(b.to));
+}
+
+/* What a "once" line says where a quantity would be: it applies, an
+   insurance-only line cancelled it, or the client's package fee stands in. */
+const onceLabel = it => it.suppressed ? "waived" : it.replaced ? "replaced by package" : "applies once";
 
 /* One row per priced line. `min` lines show no quantity box because they apply
    once or not at all, and a line that does not exist for this client type reads
@@ -6099,7 +6236,7 @@ function priceRow(it) {
   }
   const step = it.kind === "hour" ? "0.25" : "1";
   const ctl = it.kind === "min"
-    ? '<span class="once" data-ponce="' + it.i + '">' + (it.suppressed ? "waived" : "applies once") + "</span>"
+    ? '<span class="once" data-ponce="' + it.i + '">' + onceLabel(it) + "</span>"
     : '<span class="stepper"><button type="button" data-pstep="' + esc(it.id) + '" data-d="-1" ' +
       'aria-label="One fewer ' + esc(it.label) + '">&minus;</button>' +
       '<input class="n" type="number" min="0" step="' + step + '" data-pq="' + esc(it.id) +
@@ -6112,6 +6249,15 @@ function priceRow(it) {
     (it.note ? '<span class="rnote">' + esc(it.note) + "</span>" : "") + "</span>" + ctl +
     '<span class="price">' + money(it.price) + per + "</span>" +
     '<span class="amt" data-pamt="' + it.i + '">' + amt(amount) + "</span></div>";
+}
+
+/* A group of sections — Upfront, Ongoing, Payable separately — with the total
+   it adds up to, so the two numbers that matter are named in large type right
+   where their lines start. */
+function rowGroup(title, note, totalId, total) {
+  return '<div class="rowgrp"><span class="t">' + esc(title) + "</span>" +
+    (note ? '<span class="n">' + esc(note) + "</span>" : "") +
+    (totalId ? '<span class="tot" id="' + totalId + '">' + money(total) + "</span>" : "") + "</div>";
 }
 
 /* A run of rows under one rule, with the section's total sitting on that rule. */
@@ -6140,7 +6286,7 @@ function pricingAdviceView(p) {
     quoteCard("Fee as % of FUM", a.pctOfFum === null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%",
               a.fum > 0 ? "on " + money(a.fum) : "enter FUM below") +
     quoteCard("Service package", a.pack ? a.pack.name : "—",
-              a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee") +
+              packCardNote(a)) +
     /* Shown whenever ancillary services exist, not whenever one is used: a card
        that appears halfway through typing moves everything beside it. */
     (a.ancSet ? quoteCard("Ancillary services", ancCard(a).v, ancCard(a).n) : ""));
@@ -6160,10 +6306,11 @@ function pricingAdviceView(p) {
 
   /* Upfront before ongoing: it is the conversation's first question, and the
      ongoing fee is the one the client lives with afterwards. */
-  html += rowSection("Upfront — SOA fees", "ptSoa", sum("soa"),
+  html += rowGroup("Upfront", "paid once", "ptUpGrp", a.upfront);
+  html += rowSection("SOA fees", "ptSoa", sum("soa"),
     rows("soa").length ? rows("soa").map(priceRow).join("") : '<div class="rrow off"><span class="lbl">No SOA lines set.</span></div>');
 
-  html += rowSection("Upfront — implementation", "ptImpl", sum("impl"),
+  html += rowSection("Implementation", "ptImpl", sum("impl"),
     rows("impl").length ? rows("impl").map(priceRow).join("") : '<div class="rrow off"><span class="lbl">No implementation lines set.</span></div>');
 
   /* Ongoing carries the FUM ladder under its own lines, band by band, so the
@@ -6171,6 +6318,14 @@ function pricingAdviceView(p) {
   let ongoing = rows("csa").length
     ? rows("csa").map(priceRow).join("")
     : '<div class="rrow off"><span class="lbl">No ongoing lines set.</span></div>';
+  /* The package fee, when it stands in for the minimum. Always drawn and shown
+     or hidden by paintPricing(), because typing FUM repaints in place — a row
+     that only existed after a rebuild would appear a keystroke late, or never. */
+  ongoing += '<div class="rrow" id="ptPkgRow"' + (a.packLift ? "" : ' style="display:none"') + '>' +
+    '<span class="lbl"><span id="ptPkgName">' + esc(a.pack ? a.pack.name : "") + "</span> package fee" +
+    '<span class="rnote">the least an agreement in this package can be</span></span>' +
+    '<span class="once" id="ptPkgBand">' + esc(packBandLabel(a)) + "</span>" +
+    '<span class="price"></span><span class="amt" id="ptPkgAmt">' + money(a.packAmount) + "</span></div>";
   ongoing += a.ladder.length
     ? a.ladder.map((b, i) => {
         const to = i + 1 < a.ladder.length ? a.ladder[i + 1].from : null;
@@ -6185,11 +6340,13 @@ function pricingAdviceView(p) {
     : '<div class="band off"><span class="lbl">No FUM bands set for ' + esc(ct) +
       " clients, so FUM adds nothing.</span><span class=\"r\"></span><span class=\"a\">&mdash;</span></div>";
 
-  html += rowSection("Ongoing — every year", "ptOngoing", a.ongoing, ongoing,
+  html += rowGroup("Ongoing", "every year", "ptOnGrp", a.ongoing);
+  html += rowSection("Service agreement and FUM", "ptOngoing", a.ongoing, ongoing,
     "<strong>Marginal, like tax brackets.</strong> The first band charges nothing &mdash; it is the stretch of " +
     "FUM the minimum above already covers. Each band after that charges its rate only on the part of the balance " +
     "inside it, so the minimum and the FUM fee add together rather than one replacing the other.");
 
+  html += rowGroup("Payable separately", "not in either total", null, null);
   html += rowSection("Fee for service — hourly", "ptHourly", sum("hourly"),
     rows("hourly").length ? rows("hourly").map(priceRow).join("") : '<div class="rrow off"><span class="lbl">No hourly rates set.</span></div>',
     "Charged by the hour and outside any agreement, so it is not part of either total above.");
@@ -6364,7 +6521,9 @@ function shortMoney(n) {
   n = num(n);
   const trim = v => String(+v.toFixed(2));
   if (n >= 1e6) return "$" + trim(n / 1e6) + "m";
-  if (n >= 1e3) return "$" + trim(n / 1e3) + "k";
+  /* Whole thousands: a band can stop at the client's own FUM, and "$532.01k"
+     is noise in small print — the exact figure is on the line above it. */
+  if (n >= 1e3) return "$" + Math.round(n / 1e3) + "k";
   return money(n);
 }
 /* Two decimals, the way the calculator screen shows a band's rate. */
@@ -6446,7 +6605,11 @@ function buildAdviceReport(info) {
   };
 
   const upfront = used("soa").map(i => lineOf(i, "SOA — ")).join("") + used("impl").map(i => lineOf(i)).join("");
-  let ongoing = used("csa").map(i => lineOf(i)).join("");
+  /* Where the package fee stands in for the minimum, it leads the column — it
+     is the figure the agreement is built on, and the minimum it replaced has no
+     amount left to show. */
+  let ongoing = (a.packLift ? pqLine(esc(a.pack.name) + " package fee", money(a.packAmount), { q: esc(packBandLabel(a)) }) : "") +
+    used("csa").map(i => lineOf(i)).join("");
   if (a.ladder.length && a.fum > 0) {
     ongoing += pqLine("FUM fee", money(a.fumFee), { q: "on " + money(a.fum) }) + pqHint(bandHint(a.ladder, a.fum));
   }
@@ -6629,7 +6792,7 @@ function paintPricing() {
     /* A minimum that an insurance-only line has cancelled says so where its
        quantity would otherwise be. */
     const once = document.querySelector('[data-ponce="' + it.i + '"]');
-    if (once) once.textContent = it.suppressed ? "waived" : "applies once";
+    if (once) once.textContent = onceLabel(it);
   });
   const sum = s => a.items.filter(i => i.section === s).reduce((x, i) => x + i.amount, 0);
   set("#ptSoa", money(sum("soa")));
@@ -6647,6 +6810,16 @@ function paintPricing() {
   });
   set("#ptFum", money(a.fumFee));
   set("#ptOngoing", money(a.ongoing));
+  set("#ptUpGrp", money(a.upfront));
+  set("#ptOnGrp", money(a.ongoing));
+  /* The package row comes and goes as FUM crosses a band. */
+  const pkgRow = document.querySelector("#ptPkgRow");
+  if (pkgRow) {
+    pkgRow.style.display = a.packLift ? "" : "none";
+    const nm = document.querySelector("#ptPkgName"); if (nm) nm.textContent = a.pack ? a.pack.name : "";
+    const bd = document.querySelector("#ptPkgBand"); if (bd) bd.textContent = packBandLabel(a);
+    set("#ptPkgAmt", money(a.packAmount));
+  }
   set("#ptCentrelink", money(a.centrelink));
   set("#ptAncOnce", money(a.ancOnce));
   set("#ptAncYear", money(a.ancYear));
@@ -6661,7 +6834,7 @@ function paintPricing() {
     vals[3].textContent = a.pack ? a.pack.name : "—";
     if (notes.length >= 4) {
       notes[2].textContent = a.fum > 0 ? "on " + money(a.fum) : "enter FUM below";
-      notes[3].textContent = a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee";
+      notes[3].textContent = packCardNote(a);
     }
     /* The fifth card is there only when ancillary services are set up. */
     if (vals.length >= 5) {
@@ -7056,12 +7229,13 @@ function pricingSections(ro) {
       } },
 
     { key: "p-packages", title: "Service packages",
-      sub: "The tiers, and the Centrelink administration fee each carries",
+      sub: "The tiers, the FUM band each covers, and the Centrelink administration fee each carries",
       meta: (p.packages || []).length + " package" + ((p.packages || []).length === 1 ? "" : "s"),
-      warn: (p.packages || []).length ? "" : "none set",
+      warn: !(p.packages || []).length ? "none set" : packBandMismatch(p),
       actions: addBtn('data-peadd="pack"', "Add package"),
       body: () =>
-        '<div class="tbl-scroll"><table><thead><tr><th>Package</th><th class="num">Ongoing fee from</th>' +
+        '<div class="tbl-scroll"><table><thead><tr><th>Package</th><th class="num">Package fee</th>' +
+        "<th>FUM — new</th><th>FUM — existing</th>" +
         '<th class="num">Centrelink admin</th><th class="num">Means tested</th>' + (ro ? "" : '<th class="no-print"></th>') +
         "</tr></thead><tbody>" +
         (p.packages || []).map((k, i) =>
@@ -7069,19 +7243,30 @@ function pricingSections(ro) {
             esc(k.name || "") + '"' + ro + "></td>" +
           '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="from" value="' +
             num(k.from) + '"' + ro + "></td>" +
+          /* Shown, not typed: the band comes from the FUM ladders above, by
+             position, so there is one place a band is set and it cannot drift
+             from the package it decides. */
+          '<td class="small muted">' + esc(packageBandText(p, k, "NEW")) + "</td>" +
+          '<td class="small muted">' + esc(packageBandText(p, k, "EXISTING")) + "</td>" +
           '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="cas" value="' +
             num(k.cas) + '"' + ro + "></td>" +
           '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="mtf" value="' +
             num(k.mtf) + '"' + ro + "></td>" + del("pack", i) + "</tr>").join("") +
-        '<tr><td class="muted">No agreement</td><td class="num muted">&mdash;</td>' +
+        '<tr><td class="muted">No agreement</td><td class="num muted">&mdash;</td><td></td><td></td>' +
         '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="cas" value="' +
           num((p.noCsa || {}).cas) + '"' + ro + "></td>" +
         '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="mtf" value="' +
           num((p.noCsa || {}).mtf) + '"' + ro + "></td>" + (ro ? "" : "<td></td>") + "</tr>" +
         "</tbody></table></div>" +
-        '<div class="spacer"></div><div class="small muted">A client falls into the highest package their <strong>total ongoing ' +
-        "fee</strong> reaches. The two Centrelink columns are that package's administration fee &mdash; the second applies when " +
-        "the client needs quarterly means-tested updates. Neither is part of the Client Service Agreement.</div>" },
+        '<div class="spacer"></div><div class="small muted"><strong>The package follows the client\'s FUM.</strong> The packages ' +
+        "line up with the <strong>FUM ladders</strong> above in order, lowest fee first: the first band is the first package, the " +
+        "second band the second, and so on &mdash; using the new or existing ladder to match the client. To move where a package " +
+        "starts, move the band." +
+        "<br><br><strong>Package fee</strong> is the least the ongoing fee can be in that package. It replaces the Individual &amp; " +
+        "Partner minimum when it is higher; additional people, entities and the FUM fee still add on top. A package fee of " +
+        "0 leaves the minimum as it is." +
+        "<br><br>The two Centrelink columns are that package's administration fee &mdash; the second applies when the client " +
+        "needs quarterly means-tested updates. Neither is part of the Client Service Agreement.</div>" },
 
     { key: "p-claims", title: "Insurance claims",
       sub: "TPD benefit tiers, hourly rates, and the multi-claim discount",
@@ -7356,6 +7541,10 @@ const ROLE_BLURB = {
   Admin:   "Everything, plus this screen and Settings. Only an Admin can add or remove people."
 };
 
+/* The name a new row starts with, and the test for one still wearing it. */
+const placeholderName = role => role === "Adviser" ? "Surname, First" : "New " + String(role).toLowerCase();
+const isPlaceholderName = a => !String(a.name || "").trim() || a.name === placeholderName(a.role || "Adviser") ? 1 : 0;
+
 function viewPeople() {
   let html = '<div class="banner warn no-print"><strong>Role decides which screens someone sees, not what they can reach.</strong> ' +
     'Anyone with access to the SharePoint site can read the underlying lists directly. Treat this as keeping people on the right ' +
@@ -7382,10 +7571,43 @@ function viewPeople() {
       "no copy of a completed one. Set a region below, or <strong>" + esc(REGION_ALL) + "</strong> if they cover more than one.</div>";
   }
 
+  /* Advisers with clients in the open month whose region cannot be worked out —
+     which is what empties the Region filter on Review. Matching is exact, so
+     where a row in People is the same name in different capitals or spacing,
+     that is named too: it is nearly always the cause, and invisible by eye. */
+  if (state.calc) {
+    const squashName = s => String(s || "").toLowerCase().replace(/\s*,\s*/g, ",").replace(/\s+/g, " ").trim();
+    const gaps = new Map();
+    for (const m of state.calc.masters) {
+      if ([REGION_NOT_IN_PEOPLE, REGION_INACTIVE, REGION_UNSET].includes(m.region) && m.adviser) gaps.set(m.adviser, m.region);
+    }
+    if (gaps.size) {
+      const why = (name, reason) => {
+        if (reason === REGION_NOT_IN_PEOPLE) {
+          const near = state.advisers.find(a => squashName(a.name) === squashName(name));
+          return near ? "People has <strong>" + esc(near.name) + "</strong> &mdash; the same name in different capitals or spacing"
+                      : "no row in People with this exact name";
+        }
+        return reason === REGION_INACTIVE ? "their row in People is not ticked Active" : "no region set in People";
+      };
+      html += '<div class="banner warn no-print"><strong>' + gaps.size + " adviser" + (gaps.size === 1 ? "" : "s") +
+        " with clients in " + esc(monthLabel(state.runKey)) + " " + (gaps.size === 1 ? "has" : "have") +
+        " no region on Review.</strong> The name here has to match Xplan's exactly.<ul style=\"margin:6px 0 0 18px\">" +
+        [...gaps].map(([n, r]) => "<li>" + esc(n) + " &mdash; " + why(n, r) + "</li>").join("") + "</ul></div>";
+    }
+  }
+
   for (const role of ROLES) {
     const people = state.advisers
       .map((a, i) => ({ a, i }))
-      .filter(x => (x.a.role || "Adviser") === role);
+      .filter(x => (x.a.role || "Adviser") === role)
+      /* Alphabetical for reading — the index each row carries is still its
+         position in the directory, which is what every edit writes back to, so
+         the order on screen never touches which SharePoint row is which.
+         Somebody just added keeps the top spot until they are named, instead of
+         landing among the S's as "Surname, First" and being hunted for. */
+      .sort((x, y) => (isPlaceholderName(y.a) - isPlaceholderName(x.a)) ||
+        String(x.a.name).localeCompare(String(y.a.name), "en-AU", { sensitivity: "base" }));
 
     html += '<div class="card" style="margin-bottom:16px"><div class="card-h"><h2>' +
       esc(rolePlural(role)) + "</h2>" +
@@ -7645,6 +7867,19 @@ function wire() {
 
   document.querySelectorAll("[data-csafilter]").forEach(el =>
     el.addEventListener("click", () => { state.csaFilter = el.dataset.csafilter; render(); }));
+  if ($("#csaAdv")) $("#csaAdv").addEventListener("change", e => { state.csaAdviser = e.target.value; render(); });
+  if ($("#csaReg")) $("#csaReg").addEventListener("change", e => { state.csaRegion = e.target.value; render(); });
+  if ($("#csaQ")) {
+    /* Same as Review's search: the screen rebuilds on every keystroke, so the
+       cursor is put back where it was. */
+    $("#csaQ").addEventListener("input", e => {
+      state.csaQuery = e.target.value;
+      const at = e.target.selectionStart;
+      render();
+      const box = $("#csaQ");
+      if (box) { box.focus(); try { box.setSelectionRange(at, at); } catch (err) {} }
+    });
+  }
 
   document.querySelectorAll("[data-csamark]").forEach(el =>
     el.addEventListener("click", () => markCsaSigned(el.dataset.csamark)));
@@ -8162,14 +8397,14 @@ function wire() {
   document.querySelectorAll("[data-adv]").forEach(el =>
     el.addEventListener("change", () => {
       const a = state.advisers[+el.dataset.adv], f = el.dataset.f;
-      a[f] = (f === "active") ? el.checked : el.value;
+      a[f] = (f === "active") ? el.checked : f === "name" ? el.value.trim() : el.value;
       saveAdvisers(); render();
     }));
   document.querySelectorAll("[data-addrole]").forEach(el =>
     el.addEventListener("click", () => {
       const role = el.dataset.addrole;
       state.advisers.push({
-        name: role === "Adviser" ? "Surname, First" : "New " + role.toLowerCase(),
+        name: placeholderName(role),
         role, region: role === "Adviser" ? REGIONS[0] : REGION_NONE, email: "", active: true
       });
       saveAdvisers(); render();
