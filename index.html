@@ -325,6 +325,17 @@ td input.num{text-align:right}
 .pill.bad{background:var(--bad-bg);color:var(--bad-fg);border-color:var(--bad-line)}
 .pill.info{background:var(--info-bg);color:var(--info-fg);border-color:var(--info-line)}
 .pill.mute{background:var(--mute-bg);color:var(--ink-2);border-color:var(--line-strong)}
+/* Two-way pill toggles on a fund (Include/Exclude, Fixed fee/%). Amber ring
+   until picked, where picking is required. */
+.pickset{display:inline-flex;border:1px solid var(--line-strong);border-radius:var(--r-pill);overflow:hidden;white-space:nowrap}
+.pickset.need{border-color:var(--warn-line);box-shadow:0 0 0 2px var(--warn-bg)}
+.pickbtn{font:inherit;font-size:.72rem;padding:3px 10px;border:0;background:transparent;color:var(--ink-2);cursor:pointer}
+.pickbtn + .pickbtn{border-left:1px solid var(--line-strong)}
+.pickbtn:hover:not(:disabled){background:var(--surface-2)}
+.pickbtn.on{background:var(--s1);color:#fff}
+.pickbtn:disabled{cursor:default;opacity:.7}
+.workings{cursor:help;border-bottom:1px dotted var(--ink-muted)}
+.tiermove{margin-top:3px}
 
 .drop{border:2px dashed var(--line-strong);border-radius:var(--r-lg);padding:40px 24px;text-align:center;background:var(--surface-2);cursor:pointer;transition:border-color .12s ease,background .12s ease}
 .drop:hover{border-color:var(--s1)}
@@ -3492,12 +3503,14 @@ function calculate(run) {
   const priced = pricingFor(run);
   const rc = priced.rc;
   const overrides = run.overrides || {};
+  const pickRule = !FROZEN_STATUS.includes(run.status);
   const advIndex = new Map(state.advisers.map(a => [a.name, a]));
   const catIndex = new Map(rc.categories.map(c => [String(c.name).toLowerCase(), tierFee(c)]));
   /* The top of each tier's band, so a fee can be checked against the tier it is
      supposed to sit in. Null for the open-ended top tier. */
   const bands = categoryBands(rc);
   const catCeil = new Map(bands.map(b => [String(b.c.name).toLowerCase(), b.to]));
+  const catFloor = new Map(bands.map(b => [String(b.c.name).toLowerCase(), b.from]));
   /* Distinct floors in order, for naming the tier a fee actually lands in — and
      now for pricing a client in it, since each tier carries its own base fee.
 
@@ -3595,8 +3608,15 @@ function calculate(run) {
 
     r.autoIncluded = r.vendorUsed !== "N/A";                       // Q
     r.override = ov.include || "";                                 // R — "", Include, Exclude
+    /* The adviser picks Include or Exclude on every fund, and a fund counts for
+       nothing until they do. A fund they added by hand is already a choice.
+       Locked and sent months keep the old rule — Xplan's answer when nothing was
+       picked — so their figures never move. */
+    r.unpicked = !r.override && !r.manual && pickRule && !isEmptyDefault(r);
     r.included = r.override === "Exclude" ? false
                : r.override === "Include" ? true
+               : r.manual ? true
+               : pickRule ? false
                : r.autoIncluded;
 
     /* T groups by Client Group ID when Xplan supplies one, otherwise by the
@@ -3727,8 +3747,49 @@ function calculate(run) {
       if (t) { m.tierByFee = t.name; m.tierUpFee = fee; m.tierUpBase = t.fee; }
     }
 
+    /* Rarely, the other way: a fee that sits under the floor of the client's
+       own tier lands in the one below. Priced there under the same floors. */
+    m.tierFloor = catFloor.has(String(lookup).toLowerCase()) ? catFloor.get(String(lookup).toLowerCase()) : null;
+    m.belowTier = !m.aboveTier && m.rateCardFee != null && m.tierFloor != null && m.rateCardFee < m.tierFloor;
+    if (m.belowTier) {
+      const t = tierFor(m.rateCardFee);
+      if (t && t.from < m.tierFloor) {
+        m.tierByFee = t.name; m.tierUpBase = t.fee;
+        m.tierUpFee = Math.max(t.fee + m.entityFee + m.surcharge, m.currentFee, rc.absoluteMinimum);
+      }
+    }
+
+    /* The Proposed Fee is the fee in the tier they belong in. When that is not
+       their own tier, the client is priced in the new one and the category cell
+       says where they are moving — so the fee box opens on the right figure. */
+    m.ownCardFee = m.rateCardFee;
+    m.priceTier = lookup;
+    m.priceBase = m.baseFee;
+    m.proposedTier = null;
+    m.tierMove = "";
+    if (m.tierUpFee != null && m.tierByFee &&
+        String(m.tierByFee).toLowerCase() !== String(lookup).toLowerCase()) {
+      m.proposedTier = m.tierByFee;
+      m.tierMove = m.aboveTier ? "up" : "down";
+    }
+    /* A locked or sent month was priced in the client's own tier, and keeps it.
+       The move is still shown, but the figures are left as they were sent. */
+    m.repriced = !!(m.proposedTier && pickRule);
+    if (m.repriced) {
+      m.priceTier = m.tierByFee;
+      m.priceBase = m.tierUpBase;
+      m.rateCardFormula = m.tierUpBase + m.entityFee + m.surcharge;
+      m.rateCardFee = m.tierUpFee;
+      m.rateCardBy = m.rateCardFee === m.rateCardFormula ? "formula"
+                   : m.rateCardFee === m.currentFee ? "current" : "minimum";
+    }
+
     const ov = overrides["master:" + m.masterId] || {};
-    m.pctInput = ov.pctInput != null ? num(ov.pctInput) : null;                 // AB, when typed over
+    /* A percentage is set on a fund now, never on the client line. One typed
+       here before that change is ignored, not converted — except in a locked or
+       sent month, whose figures stay as they were sent. */
+    m.pctInput = (!pickRule && ov.pctInput != null) ? num(ov.pctInput) : null;
+    m.unpickedFunds = m.rows.filter(r => r.unpicked).length;
     m.comment = ov.comment || "";                                               // AM
     /* Taken out of this month's review by the adviser. The client stays in the
        extract — this is an override, not a deletion — but drops out of every
@@ -4854,12 +4915,15 @@ function viewMyClients() {
   if (!locked) {
     html += '<div class="card no-print" style="margin-bottom:16px"><div class="card-h"><h2>What to check</h2></div><div class="card-b">' +
       '<ol style="margin:0;padding-left:20px;color:var(--ink-2)">' +
-      "<li>Expand a client and confirm each account should be counted. Set <strong>Include</strong> or <strong>Exclude</strong> to change it.</li>" +
+      "<li>Expand each client and pick <strong>Include</strong> or <strong>Exclude</strong> on every account. An account counts for " +
+      "nothing until it is picked, and stays highlighted until then.</li>" +
       "<li>Check the total FUM looks right. If a subfund value is wrong, exclude it and note why in the comment.</li>" +
-      "<li>Leave both fee boxes alone to accept the rate card fee. Type over <strong>Adviser fee</strong> to set your own, or type a " +
-      "figure into <strong>% of FUM</strong> to charge a percentage instead. Clearing the box hands the client back to the rate card.</li>" +
-      "<li>To price fund by fund, set a <strong>Fee Type</strong> on any individual fund. The client's fee then becomes the sum of the " +
-      "funds &mdash; a fund percentage is charged on that fund's own balance &mdash; and any fund left unset charges nothing.</li>" +
+      "<li>Leave <strong>Adviser fee</strong> alone to accept the <strong>Proposed Fee</strong> (hover over it for the workings). " +
+      "Type over it to set your own; clearing the box hands the client back to the Proposed Fee. An arrow under the category " +
+      "means the client is changing tier, and the Proposed Fee is already priced in the new one.</li>" +
+      "<li>To price fund by fund, pick <strong>Fixed fee</strong> or <strong>%</strong> on any individual fund. The client's fee then " +
+      "becomes the sum of the funds &mdash; a fund percentage is charged on that fund's own balance &mdash; and any fund left unset " +
+      "charges nothing. Click the picked one again to undo it.</li>" +
       "<li>Payment sources sit on the funds. Expand the client and use <strong>Set payment on all funds</strong> if it all comes from " +
       "one place, then change the odd one out. The fund amounts have to add up to the fee.</li>" +
       "<li>Missing an account? <strong>+ Add fund</strong> at the bottom of the client adds one with its own name and balance.</li>" +
@@ -4925,7 +4989,7 @@ function clientTable(list, locked) {
   const span = showAdviser ? 13 : 12;
   let html = '<div class="tbl-wrap"><table><thead><tr>' +
     "<th></th><th>Master client</th>" + (showAdviser ? "<th>Adviser</th>" : "") + "<th>Category</th>" +
-    '<th class="num">Total FUM</th><th class="num">Current fee</th><th class="num">Rate card</th>' +
+    '<th class="num">Total FUM</th><th class="num">Current fee</th><th class="num">Proposed Fee</th>' +
     "<th>Fee Type</th><th>Adviser fee</th><th>% of FUM</th>" +
     '<th class="num">Movement</th><th>Payment</th><th>Comment</th></tr></thead><tbody>';
 
@@ -4936,7 +5000,7 @@ function clientTable(list, locked) {
        card is money left behind, over it is money gained. Colour says which. */
     const under = m.outsideBand && m.diffToCard != null && m.diffToCard < 0;
     const bandFlag = (m.outsideBand
-        ? ' <span class="pill ' + (under ? "bad" : "ok") + '" title="' + (under ? "Below" : "Above") + " the rate card by more than " +
+        ? ' <span class="pill ' + (under ? "bad" : "ok") + '" title="' + (under ? "Below" : "Above") + " the Proposed Fee by more than " +
           (monthCard().variancePct * 100) + '%">' + (under ? "&darr; " : "&uarr; ") + money(Math.abs(m.diffToCard)) + " off band</span>"
         : "") +
       (m.belowCurrent ? ' <span class="pill bad" title="Lower than the fee the client pays today">below current</span>' : "") +
@@ -4953,19 +5017,7 @@ function clientTable(list, locked) {
             " cannot come off the platform (" + r.limitedBy + ")").join(" · ")) + '">' +
           (m.houseSplitApplies ? "FUM under the minimum &mdash; " : "needs direct debit &mdash; ") +
           money(m.splitFunds.reduce((a, r) => a + r.shortfall, 0)) + " by direct debit</span>" : "") +
-      (m.mode === "Variable" && m.unsetFunds ? ' <span class="pill warn">' + m.unsetFunds + " fund" + (m.unsetFunds > 1 ? "s" : "") + " unset</span>" : "") +
-      /* The tier they belong in, and what they would pay there — so the pill
-         answers "and what would that mean?" without anybody working it out. The
-         hover carries the sum, in the same terms as the rate card cell. */
-      (m.aboveTier ? ' <span class="pill warn" title="' +
-          esc("The rate card fee is " + money(m.aboveTierBy) + " above the top of " + (m.mappedTo || m.category) +
-            " (" + money(m.tierCeiling) + ")." +
-            (m.tierByFee && m.tierUpFee != null
-              ? " In " + m.tierByFee + " it would be " + money(m.tierUpFee) + ": " + tierUpSum(m) + "."
-              : m.tierByFee ? " On this fee they sit in " + m.tierByFee + "." : "") +
-            " Check the category in Xplan.") + '">above tier' +
-          (m.tierByFee ? " &mdash; " + esc(m.tierByFee) + (m.tierUpFee != null ? " " + money(m.tierUpFee) : "") : "") +
-          "</span>" : "");
+      (m.mode === "Variable" && m.unsetFunds ? ' <span class="pill warn">' + m.unsetFunds + " fund" + (m.unsetFunds > 1 ? "s" : "") + " unset</span>" : "");
     html += "<tr>" +
       '<td><button class="expand" data-exp="' + esc(m.masterId) + '">' + (open ? "&minus;" : "+") + "</button></td>" +
       /* Three lines, in the order somebody scans them: who, which record, how
@@ -4976,15 +5028,15 @@ function clientTable(list, locked) {
           (m.addedBy ? " — added by " + esc(m.addedBy) : "") + '">added</span>' : "") +
         '<div class="small muted mono">Xplan ' + esc(m.masterId) + "</div>" +
         '<div class="small muted">' + m.rows.length + " accounts" + (added.length ? " (" + added.length + " added)" : "") +
-        (m.entityWeightTotal ? " &middot; +" + m.entityWeightTotal + " entity wt" : "") + "</div></td>" +
+        (m.entityWeightTotal ? " &middot; +" + m.entityWeightTotal + " entity wt" : "") + "</div>" +
+        (m.unpickedFunds && !locked ? '<div><span class="pill warn" title="Expand the client and pick Include or Exclude on each. ' +
+          'A fund counts for nothing until it is picked.">' + m.unpickedFunds + " fund" + (m.unpickedFunds > 1 ? "s" : "") +
+          " to include or exclude</span></div>" : "") + "</td>" +
       (showAdviser ? "<td>" + esc(m.adviser) + '<div class="small muted">' + esc(m.region) + "</div></td>" : "") +
-      "<td>" + esc(m.category || "—") +
-        (m.mappedTo ? '<div class="small muted">prices as ' + esc(m.mappedTo) + "</div>" : "") +
-        (m.baseFee == null ? ' <span class="pill bad" title="This category has no price on the rate card. ' +
-          'It should have been set before the month opened — notify admin rather than pricing round it.">no rate</span>' : "") + "</td>" +
+      "<td>" + categoryCell(m) + "</td>" +
       '<td class="num">' + money(m.totalFum) + "</td>" +
       '<td class="num">' + money(m.currentFee) + "</td>" +
-      '<td class="num">' + money(m.rateCardFee) + rateCardBreakdown(m) + "</td>" +
+      '<td class="num">' + proposedFeeCell(m) + "</td>" +
       "<td>" + modeCell(m) + "</td>" +
       '<td>' + feeCell(m, locked) + bandFlag + "</td>" +
       "<td>" + pctCell(m, locked) + "</td>" +
@@ -5013,7 +5065,7 @@ function clientTable(list, locked) {
           '<td class="num small muted">' + pct(r.weight) + " of FUM</td>" +
           '<td class="num small muted">' + (variable ? "&mdash;" : money(r.feeShare) + " share") + "</td>" +
           /* Setting a fee type here is what makes the client variable. */
-          "<td>" + (r.included ? fundSelect(r, "mode", ["", "Fixed Fee", "Percentage"], locked) : "") + "</td>" +
+          "<td>" + (r.included ? feeTypePills(r, locked) : "") + "</td>" +
           "<td>" + (r.included ? fundFeeCell(r, m, locked) + fundCapNote(r, m, locked) : "") + "</td>" +
           "<td>" + (r.included ? fundPctCell(r, locked) : "") + "</td>" +
           '<td class="num small muted">' + (variable ? "" : money(r.varianceShare)) + "</td>" +
@@ -5039,13 +5091,28 @@ function clientTable(list, locked) {
   return html;
 }
 
-/* Include / Exclude on an account. The only client-line select left; pricing
-   and payment both moved onto the funds. */
+/* A pair of pill buttons standing in for a dropdown. `cur` is the picked value
+   or "". `clearable` lets a second click on the picked one put it back to "". */
+function pickPills(r, field, opts, cur, locked, clearable, attention) {
+  return '<div class="pickset' + (attention ? " need" : "") + '"' +
+    (attention ? ' title="Pick one — this fund counts for nothing until you do"' : "") + ">" +
+    opts.map(([v, label]) => '<button type="button" class="pickbtn' + (cur === v ? " on" : "") + '" data-pick="' + esc(r.key) +
+      '" data-f="' + field + '" data-v="' + esc(cur === v && clearable ? "" : v) + '"' + (locked ? " disabled" : "") + ">" +
+      label + "</button>").join("") + "</div>";
+}
+
+/* Include / Exclude on an account. Nothing is picked until the adviser picks it
+   (see r.unpicked), and the pair is highlighted until then. */
 function includeSelect(r, locked) {
-  return '<select class="w110" data-ro="' + esc(r.key) + '" data-f="include"' + (locked ? " disabled" : "") + ">" +
-    ["", "Include", "Exclude"].map(o =>
-      '<option value="' + esc(o) + '"' + (r.override === o ? " selected" : "") + ">" + esc(o || "Auto") + "</option>").join("") +
-    "</select>";
+  /* A locked month that predates picking shows what it was priced on. */
+  const cur = r.override || (r.unpicked ? "" : r.included ? "Include" : "Exclude");
+  return pickPills(r, "include", [["Include", "Include"], ["Exclude", "Exclude"]], cur, locked, false, r.unpicked);
+}
+
+/* Fixed fee or % on a fund. Optional: neither picked means the fund shares the
+   client's fee, so a second click on the picked one hands it back. */
+function feeTypePills(r, locked) {
+  return pickPills(r, "mode", [["Fixed Fee", "Fixed fee"], ["Percentage", "%"]], r.feeMode || "", locked, true, false);
 }
 
 /* One name for each way a client can be priced, used on the client line, in
@@ -5053,23 +5120,43 @@ function includeSelect(r, locked) {
 function feeTypeLabel(m) {
   return m.mode === "Variable" ? "By fund"
        : m.mode === "Percentage" ? "% of FUM"
-       : m.mode === "Fixed Fee" ? "Fixed fee" : "Rate card";
+       : m.mode === "Fixed Fee" ? "Fixed fee" : "Proposed fee";
 }
 
-/* Under the rate card fee: what made it. The parts are named, zero parts are
-   left out, and when a floor won — the client's current fee, or the absolute
-   minimum — that is said first, with the formula's own total after it, so the
-   line under the figure always adds up to something it actually states. */
-function rateCardBreakdown(m) {
-  if (m.baseFee == null) return '<div class="small muted">&mdash;</div>';
-  const parts = [esc(m.mappedTo || m.category || "Tier") + " " + money(m.baseFee)];
+/* The workings behind the Proposed Fee, as plain text for its hover. The parts
+   are named, zero parts left out, and when a floor won — the client's current
+   fee, or the absolute minimum — that is said, so the sum always adds up to
+   something it actually states. */
+function feeWorkings(m) {
+  if (m.priceBase == null) return "";
+  const parts = [(m.priceTier || "Tier") + " " + money(m.priceBase)];
   if (m.entityFee) parts.push("entities " + money(m.entityFee));
   if (m.surcharge) parts.push("FUM " + money(m.surcharge));
-  const sum = parts.join(" + ");
-  if (m.rateCardBy === "formula") return '<div class="small muted">' + sum + "</div>";
-  return '<div class="small muted">' +
-    (m.rateCardBy === "current" ? "held at current fee" : "raised to the minimum") + "</div>" +
-    '<div class="small muted">' + sum + (parts.length > 1 ? " = " + money(m.rateCardFormula) : "") + "</div>";
+  const lines = [parts.join(" + ") + (parts.length > 1 ? " = " + money(m.rateCardFormula) : "")];
+  if (m.rateCardBy === "current") lines.push("Held at the current fee, " + money(m.rateCardFee) + ".");
+  if (m.rateCardBy === "minimum") lines.push("Raised to the minimum, " + money(m.rateCardFee) + ".");
+  if (m.repriced) lines.push("Priced in " + m.priceTier + ", the tier they are moving to. In " +
+    (m.mappedTo || m.category) + " it would be " + money(m.ownCardFee) + ".");
+  return lines.join("\n");
+}
+
+function proposedFeeCell(m) {
+  if (m.rateCardFee == null) return '<span class="muted">&mdash;</span>';
+  return '<span class="workings" title="' + esc(feeWorkings(m)) + '">' + money(m.rateCardFee) + "</span>";
+}
+
+/* Their category today, and the tier they are moving to when the fee has
+   carried them out of it — which is the tier the Proposed Fee is priced in. */
+function categoryCell(m) {
+  const own = m.mappedTo || m.category;
+  return esc(m.category || "—") +
+    (m.mappedTo ? '<div class="small muted">prices as ' + esc(m.mappedTo) + "</div>" : "") +
+    (m.proposedTier ? '<div><span class="pill ' + (m.tierMove === "up" ? "warn" : "info") + ' tiermove" title="' +
+      esc((m.tierMove === "up" ? "Grown past the top of " : "Under the floor of ") + own +
+        ". Proposed: " + m.proposedTier + ". Update the category in Xplan once agreed.") + '">' +
+      (m.tierMove === "up" ? "&uarr; " : "&darr; ") + esc(m.proposedTier) + "</span></div>" : "") +
+    (m.baseFee == null ? ' <span class="pill bad" title="This category has no price on the rate card. ' +
+      'It should have been set before the month opened — notify admin rather than pricing round it.">no rate</span>' : "");
 }
 
 /* The sum behind the "above tier" fee, in the same words as the rate card
@@ -5187,10 +5274,7 @@ function fundFeeCell(r, m, locked) {
 }
 
 function fundPctCell(r, locked) {
-  if (r.feeMode !== "Percentage") {
-    return r.fundFee != null && r.valueUsed > 0
-      ? '<span class="mono small muted">' + pct(r.fundFee / r.valueUsed) + "</span>" : "";
-  }
+  if (r.feeMode !== "Percentage") return "";
   return '<input type="number" step="0.001" class="w80 num" data-ro="' + esc(r.key) + '" data-f="pct" value="' +
     (r.fundPct == null ? "" : (r.fundPct * 100).toFixed(3)) + '"' + (locked ? " disabled" : "") +
     '><div class="small muted">% of fund</div>';
@@ -5279,7 +5363,9 @@ function feeCell(m, locked) {
 /* The other half of the pair: type a percentage and the client prices off total
    FUM. Read-only only when the funds are doing the pricing. */
 function pctCell(m, locked) {
-  if (m.mode === "Variable") return '<span class="mono small">' + pct(m.pctOfFum) + "</span>";
+  /* A percentage lives on the funds now. The client line only shows one in a
+     locked month that was priced that way before the change. */
+  if (m.mode !== "Percentage") return "";
   return '<input type="number" step="0.001" class="w80 num" data-mo="' + esc(m.masterId) + '" data-f="pctInput" value="' +
     (m.pctInput == null ? "" : (m.pctInput * 100).toFixed(3)) + '"' + (locked ? " disabled" : "") +
     ' placeholder="' + (m.pctOfFum == null ? "" : (m.pctOfFum * 100).toFixed(3)) + '"><div class="small muted">' +
@@ -5327,7 +5413,7 @@ function viewExceptions() {
   const totalUnpriced = c.unpricedCats.reduce((a, x) => a + x[1], 0);
   const off = c.masters.filter(m => m.outsideBand);
   const below = c.masters.filter(m => m.belowCurrent);
-  const aboveTier = c.masters.filter(m => m.aboveTier);
+  const aboveTier = c.masters.filter(m => m.proposedTier);
   const unsetTotal = c.unsetFundClients.reduce((a, m) => a + m.unsetFunds, 0);
 
   const capRows = [];
@@ -5378,28 +5464,23 @@ function viewExceptions() {
         : none("No client has been taken out of this review.") },
 
     { key: "abovetier", tone: "warn", count: aboveTier.length, note: "clients",
-      tile: "Above their tier", title: "Rate card fee above the client's own tier",
-      sub: "Entities and FUM have carried these clients past the top of the tier they are in. The fee is not wrong — the category probably is.",
+      tile: "Changing tier", title: "Clients changing tier",
+      sub: "Entities and FUM have carried these clients out of the tier they are in. Their Proposed Fee is priced in the new tier.",
       body: () => aboveTier.length
-        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Tier</th>' +
-          '<th class="num">Top of tier</th><th class="num">Rate card</th><th class="num">Over by</th>' +
-          '<th>Lands in</th><th class="num">Fee there</th></tr></thead><tbody>' +
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Current category</th>' +
+          '<th>Proposed category</th><th class="num">Fee in current tier</th><th class="num">Proposed Fee</th></tr></thead><tbody>' +
           aboveTier.map(m => "<tr><td>" + esc(m.name) + '<div class="small muted mono">' + esc(m.masterId) + "</div></td>" +
             "<td>" + esc(m.adviser) + "</td>" +
             "<td>" + esc(m.mappedTo || m.category || "—") +
               (m.mappedTo ? '<div class="small muted">mapped from ' + esc(m.category) + "</div>" : "") + "</td>" +
-            '<td class="num">' + money(m.tierCeiling) + '</td><td class="num">' + money(m.rateCardFee) +
-            '</td><td class="num">' + money(m.aboveTierBy) + "</td>" +
-            "<td>" + (m.tierByFee ? "<strong>" + esc(m.tierByFee) + "</strong>" : '<span class="muted">—</span>') +
-            '</td><td class="num">' + (m.tierUpFee != null
-              ? "<strong>" + money(m.tierUpFee) + "</strong>" + '<div class="small muted">' + esc(tierUpSum(m)) + "</div>"
-              : '<span class="muted">—</span>') +
-            "</td></tr>").join("") + "</tbody></table>" +
-          '<div class="spacer"></div><div class="small muted">Nothing here is blocked and no fee is changed. ' +
-          "A client outgrowing their tier is normal &mdash; the fix is the category in Xplan, not the fee. Legacy and " +
-          "inherited categories will drift into the right tier over time, so treat this as a list to work through " +
-          "rather than a fault.</div>"
-        : none("No client's rate card fee sits above the tier they are in.") },
+            "<td><strong>" + (m.tierMove === "up" ? "&uarr; " : "&darr; ") + esc(m.proposedTier) + "</strong></td>" +
+            '<td class="num">' + money(m.ownCardFee) + "</td>" +
+            '<td class="num"><strong>' + money(m.tierUpFee) + "</strong>" +
+              '<div class="small muted">' + esc(tierUpSum(m)) + "</div></td>" +
+            "</tr>").join("") + "</tbody></table>" +
+          '<div class="spacer"></div><div class="small muted">Nothing here is blocked. ' +
+          "A client changing tier is normal &mdash; once the fee is agreed, update the category in Xplan.</div>"
+        : none("No client is changing tier.") },
 
     { key: "ambiguous", tone: "warn", count: c.ambiguous.length, note: "codes",
       tile: "Codes to confirm", title: "Category codes worth confirming",
@@ -5426,7 +5507,7 @@ function viewExceptions() {
 
     { key: "below", tone: "bad", count: below.length, note: "clients",
       tile: "Below current fee", title: "Fees below the current fee",
-      sub: "A percentage can multiply out under what the client pays today. The rate card fee cannot, so these are always adviser-set.",
+      sub: "A percentage can multiply out under what the client pays today. The Proposed Fee cannot, so these are always adviser-set.",
       body: () => below.length
         ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th>Fee type</th><th class="num">Current fee</th>' +
           '<th class="num">Adviser fee</th><th class="num">Shortfall</th></tr></thead><tbody>' +
@@ -5439,7 +5520,7 @@ function viewExceptions() {
       tile: "Off band", title: "Fees outside the " + (rc.variancePct * 100) + "% band",
       sub: "A warning only — advisers are not blocked from setting these.",
       body: () => off.length
-        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Rate card</th>' +
+        ? '<table><thead><tr><th>Master client</th><th>Adviser</th><th class="num">Proposed Fee</th>' +
           '<th class="num">Adviser fee</th><th class="num">Difference</th></tr></thead><tbody>' +
           off.map(m => "<tr><td>" + esc(m.name) + "</td><td>" + esc(m.adviser) + '</td><td class="num">' + money(m.rateCardFee) +
             '</td><td class="num">' + money(m.fee) + '</td><td class="num">' + money(m.diffToCard) + "</td></tr>").join("") +
@@ -5645,10 +5726,10 @@ function attentionFor(ms, removed) {
   const platform = ms.filter(m => m.overCap || m.underMinBalance.length).length;
   const below = ms.filter(m => m.belowCurrent).length;
   const gone = (removed || []).length;
-  const tier = ms.filter(m => m.aboveTier).length;
+  const tier = ms.filter(m => m.proposedTier).length;
   if (gone) parts.push({ label: gone + " removed", cls: "bad" });
   /* Singular reads badly in an email, and this line goes in one. */
-  if (tier) parts.push({ label: tier + (tier === 1 ? " requires a tier upgrade" : " require tier upgrades"), cls: "warn" });
+  if (tier) parts.push({ label: tier + (tier === 1 ? " changes tier" : " change tier"), cls: "warn" });
   if (band) parts.push({ label: band + " off band", cls: "warn" });
   if (platform) parts.push({ label: platform + " platform issue" + (platform > 1 ? "s" : ""), cls: "bad" });
   if (below) parts.push({ label: below + " below current", cls: "bad" });
@@ -5667,7 +5748,9 @@ function approvalDetail(adviser, ms) {
   for (const m of [...ms].sort((a, b) => (b.fee || 0) - (a.fee || 0))) {
     const flags = reportFlags(m);
     h += "<tr><td><strong>" + esc(m.name) + '</strong><div class="small muted mono">Xplan ' + esc(m.masterId) + "</div></td>" +
-      "<td>" + esc(m.category || "—") + '</td><td class="num">' + money(m.totalFum) + "</td>" +
+      "<td>" + esc(m.category || "—") +
+        (m.proposedTier ? '<div class="small"><strong>' + (m.tierMove === "up" ? "&uarr; " : "&darr; ") +
+          esc(m.proposedTier) + "</strong></div>" : "") + '</td><td class="num">' + money(m.totalFum) + "</td>" +
       '<td class="num">' + money(m.currentFee) + '</td><td class="num">' + money(m.fee) +
       '</td><td class="num">' + signed(m.variance) + "</td>" +
       "<td>" + esc(feeTypeLabel(m)) + "</td>" +
@@ -7924,6 +8007,21 @@ function wire() {
     });
   });
 
+  /* The pill toggles on a fund. Same save as a dropdown change. */
+  document.querySelectorAll("[data-pick]").forEach(el =>
+    el.addEventListener("click", () => {
+      const key = el.dataset.pick, f = el.dataset.f, v = el.dataset.v;
+      const wasVariable = (state.calc.masters.find(m =>
+        m.rows.some(r => r.key === key)) || {}).mode === "Variable";
+      setOverride("row", key, { [f]: v });
+      if (v && f === "mode" && !wasVariable) {
+        const row = state.calc.rows.find(r => r.key === key);
+        if (row) toast(row.masterName + " is now priced fund by fund.");
+      }
+      markInProgress();
+      render();
+    }));
+
   /* Hand-added funds. Their name and balance are the adviser's own text, so they
      are edited in place rather than through the override machinery. */
   document.querySelectorAll("[data-addf]").forEach(el =>
@@ -9118,7 +9216,7 @@ function buildReport(opts) {
   if (anyFlag) {
     h += '<div class="legend"><b>Flags.</b> ' +
       "<i>no rate</i> — the category has no rate card entry, so the fee is not set. " +
-      "<i>off band</i> — more than " + (monthCard().variancePct * 100) + "% from the rate card fee. " +
+      "<i>off band</i> — more than " + (monthCard().variancePct * 100) + "% from the proposed fee. " +
       "<i>below current</i> — lower than the client pays today. " +
       "<i>over platform cap</i> — more than the platform will let us draw from an account; the maximum is shown. " +
       "<i>under platform minimum</i> — the balance is below what the platform needs before it will process a fee at all. " +
@@ -9209,7 +9307,7 @@ function exportCsv() {
   if (!can("ownBook") && state.filterRegion !== "all") list = list.filter(m => m.region === state.filterRegion);
 
   const head = ["Xplan ID", "Master client", "Adviser", "Region", "Category", "Accounts",
-    "Total FUM", "Current fee", "Rate card fee", "Base", "Entity fee", "FUM surcharge",
+    "Proposed category", "Total FUM", "Current fee", "Proposed fee", "Base", "Entity fee", "FUM surcharge",
     "Fee Type", "Adviser fee", "% of FUM", "Movement", "Payment source", "Comment", "Flags"];
   const lines = [head];
   for (const m of list) {
@@ -9218,8 +9316,9 @@ function exportCsv() {
       m.overCap ? "over platform cap" + (m.maxFee != null ? " (max " + Math.floor(m.maxFee) + ")" : "") : "",
       m.underMinBalance.length ? "under platform minimum" : ""].filter(Boolean).join("; ");
     lines.push([m.masterId, m.name, m.adviser, m.region, m.category, m.rows.length,
+      m.proposedTier || "",
       round2(m.totalFum), round2(m.currentFee), m.rateCardFee == null ? "" : round2(m.rateCardFee),
-      m.baseFee == null ? "" : m.baseFee, round2(m.entityFee), round2(m.surcharge),
+      m.priceBase == null ? "" : m.priceBase, round2(m.entityFee), round2(m.surcharge),
       feeTypeLabel(m), m.fee == null ? "" : round2(m.fee),
       m.pctOfFum == null ? "" : (m.pctOfFum * 100).toFixed(4) + "%",
       m.variance == null ? "" : round2(m.variance),
