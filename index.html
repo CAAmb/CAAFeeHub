@@ -318,6 +318,15 @@ td input.num{text-align:right}
 .w80,input.w80,select.w80{width:88px}
 .w110,input.w110,select.w110{width:118px}
 .w140,input.w140,select.w140{width:148px}
+.w90,input.w90{width:96px}
+.w100,select.w100{width:108px}
+.w160,input.w160{width:170px}
+.w180,input.w180{width:200px}
+/* One ancillary area on Settings. */
+.ancset{border:1px solid var(--line);border-radius:var(--r-lg);padding:12px 14px;margin-bottom:14px}
+.ancset-h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.ancset-h .spacer-x{flex:1}
+.ancset textarea{width:100%}
 
 .pill{display:inline-block;padding:2px 10px;border-radius:var(--r-pill);font-size:.7rem;letter-spacing:.04em;border:1px solid transparent;white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok-fg);border-color:var(--ok-line)}
@@ -490,6 +499,16 @@ td input.num{text-align:right}
 .rrow .amt{font-variant-numeric:tabular-nums;font-size:.92rem;min-width:86px;text-align:right}
 .rrow.off .lbl,.rrow.off .amt{color:var(--ink-muted)}
 .secnote{margin-top:11px}
+/* Ancillary areas: section subheadings, the fee box inside a guide range, the
+   GST tag on the rule, and the area's pricing notes. */
+.ancgrp{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;font-weight:700;color:var(--s1);
+  padding:12px 2px 4px;border-bottom:1px solid var(--line)}
+.rowsec-h .gst{font-size:.72rem;color:var(--ink-muted)}
+.rrow .ancfee input{width:78px;text-align:right;font:inherit;font-size:.82rem;padding:3px 6px;
+  border:1px solid var(--line-strong);border-radius:6px;background:var(--surface)}
+.rowsec.anc .rrow .price{min-width:112px}
+.ancnotes{margin:4px 0 8px;padding-left:18px}
+.ancnotes li{margin:1px 0}
 
 /* Counts go up one at a time; hours do not, so the middle stays typeable. */
 .stepper{display:flex;align-items:center;border:1px solid var(--line-strong);
@@ -635,6 +654,9 @@ td input.num{text-align:right}
 .pq-line.tot{border-bottom:0;border-top:1.5px solid #0f2433;font-weight:600;padding-top:5px}
 .pq-line.off{color:#7d8b94}
 .pq-line.hint{border:0;padding-top:0}
+.pq-sub{font-size:7.6pt;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#1f6f7a;padding:6px 0 2px;break-after:avoid}
+.pq-gst{font-size:7.6pt;font-weight:400;letter-spacing:0;text-transform:none;color:#7d8b94}
+.pq-ancnotes{font-size:7.6pt;color:#5d6b74;margin-top:4px;line-height:1.35}
 .pq-hint{color:#7d8b94;font-size:7.8pt}
 .pq-box{border:1px solid #d6dde2;border-radius:5px;padding:9px 12px;margin-top:12px;background:#f3f6f8}
 .pq-box b{color:#0f2433}
@@ -977,6 +999,10 @@ const ANCILLARY_LABEL = { each: "one-off", hour: "hourly", year: "ongoing" };
 const EMPTY_PRICING = {
   reviewed: "",                       // "30 June 2026", shown on the screen
   items: [],                          // { id, section, label, kind, newPrice, existingPrice, suppressesMin, note }
+                                      // ancillary lines add: area, group, same, rangeMin, rangeMax
+  /* Ancillary service areas — Accounting, Lending — in the order they show on
+     the calculator, each with its GST wording and pricing notes (one a line). */
+  ancAreas: [],                       // { name, gst, notes }
   /* Marginal FUM bands, one ladder per client type, in the same {from, rate}
      shape the surcharge bands use so surchargeFor() prices both. */
   ladders: { NEW: [], EXISTING: [] },
@@ -5782,6 +5808,7 @@ const pricingInputs = {
   tab: "advice",              // "advice" | "claims"
   clientType: "EXISTING",
   qty: {},                    // item id -> count, or hours for an hourly line
+  fee: {},                    // ancillary item id -> fee typed within its guide range
   fum: 0,
   onAgreement: true,
   meansTested: false,
@@ -5816,9 +5843,19 @@ function priceAdvice() {
   const p = pricing();
   const ct = pricingInputs.clientType;
   const items = (p.items || []).map((it, i) => {
-    const raw = ct === "NEW" ? it.newPrice : it.existingPrice;
-    const price = (raw === null || raw === undefined || raw === "") ? null : num(raw);
-    return { ...it, i, price, na: price === null,
+    /* An ancillary service can carry one price for both client types. */
+    const raw = (ct === "NEW" || (it.section === ANCILLARY && it.same)) ? it.newPrice : it.existingPrice;
+    let price = (raw === null || raw === undefined || raw === "") ? null : num(raw);
+    const std = price;
+    /* Inside a guide range the adviser may type their own fee, and it is held
+       to the range — never outside it, whatever is typed. */
+    const range = ancRange(it);
+    const typed = pricingInputs.fee[it.id];
+    if (price !== null && range && typed !== undefined && typed !== null && typed !== "") {
+      price = Math.min(Math.max(num(typed), range.min), range.max);
+    }
+    return { ...it, i, price, std, range, adjusted: price !== null && std !== null && price !== std,
+             na: price === null,
              qty: it.kind === "min" ? 1 : num(pricingInputs.qty[it.id] || 0) };
   });
 
@@ -5887,6 +5924,7 @@ function priceAdvice() {
     .reduce((a, i) => a + i.amount, 0);
   const ancOnce = ancSum(false), ancYear = ancSum(true);
   const ancSet = items.some(i => i.section === ANCILLARY);
+  const ancAreas = ancAreasOf(p, items.filter(i => i.section === ANCILLARY));
 
   const ongoing = csa + fumFee;
   const upfront = soa + impl;
@@ -5903,9 +5941,49 @@ function priceAdvice() {
 
   return { items, soa, impl, csa, hourly, ladder, fum, fumFee, ongoing, upfront,
            pack, packBand, packFee, packLift, packAmount, minTotal,
-           centrelink, packs, ancOnce, ancYear, ancSet,
+           centrelink, packs, ancOnce, ancYear, ancSet, ancAreas,
            pctOfFum: fum > 0 ? ongoing / fum : null };
 }
+
+/* A service's guide range, when it has a usable one — both ends set and the
+   top above the bottom. Without one the fee is fixed. */
+function ancRange(it) {
+  if (!it || it.section !== ANCILLARY) return null;
+  const lo = priceVal(it.rangeMin), hi = priceVal(it.rangeMax);
+  return (lo !== null && hi !== null && hi > lo) ? { min: lo, max: hi } : null;
+}
+
+/* Ancillary lines grouped for the screen and the report: area, then section,
+   in the order they were entered. Areas follow the settings list; a service
+   with no area falls under "Other services" at the end. */
+const ANC_NO_AREA = "Other services";
+function ancAreasOf(p, ancItems) {
+  const meta = new Map((p.ancAreas || []).map(x => [String(x.name || "").trim(), x]));
+  const names = [...meta.keys()].filter(Boolean);
+  for (const it of ancItems) {
+    const n = String(it.area || "").trim() || ANC_NO_AREA;
+    if (!names.includes(n)) names.push(n);
+  }
+  return names.map((name, k) => {
+    const its = ancItems.filter(it => (String(it.area || "").trim() || ANC_NO_AREA) === name);
+    const groups = [];
+    for (const it of its) {
+      const g = String(it.group || "").trim();
+      let grp = groups.find(x => x.name === g);
+      if (!grp) groups.push(grp = { name: g, items: [] });
+      grp.items.push(it);
+    }
+    const m = meta.get(name) || {};
+    return { k, name, gst: !!m.gst, notes: String(m.notes || ""), items: its, groups,
+             once: its.filter(i => i.kind !== "year").reduce((a, i) => a + (i.amount || 0), 0),
+             year: its.filter(i => i.kind === "year").reduce((a, i) => a + (i.amount || 0), 0) };
+  }).filter(ar => ar.items.length);
+}
+
+/* An area's total on its rule: one-off and yearly money are not added. */
+const ancAreaTotal = ar => !ar.year ? money(ar.once)
+  : !ar.once ? money(ar.year) + "/yr"
+  : money(ar.once) + " + " + money(ar.year) + "/yr";
 
 function priceClaim() {
   const c = pricing().claims || {};
@@ -6334,6 +6412,31 @@ function priceRow(it) {
     '<span class="amt" data-pamt="' + it.i + '">' + amt(amount) + "</span></div>";
 }
 
+/* An ancillary line: a priceRow, except that a service with a guide range has
+   its fee in a box the adviser can type over — held to the range — with the
+   range shown beside the name. Without a range the fee is fixed. */
+function ancRow(it) {
+  if (it.na || !it.range) return priceRow(it);
+  const per = { hour: "/hr", year: "/yr" }[it.kind] || "";
+  const step = it.kind === "hour" ? "0.25" : "1";
+  const typed = pricingInputs.fee[it.id];
+  const amount = lineAmount(it);
+  return '<div class="rrow' + (amount === null ? " off" : "") + '"><span class="lbl">' + esc(it.label) +
+    (it.note ? '<span class="rnote">' + esc(it.note) + "</span>" : "") +
+    '<span class="rnote">guide ' + money(it.range.min) + "&ndash;" + money(it.range.max) + "</span></span>" +
+    '<span class="stepper"><button type="button" data-pstep="' + esc(it.id) + '" data-d="-1" ' +
+      'aria-label="One fewer ' + esc(it.label) + '">&minus;</button>' +
+      '<input class="n" type="number" min="0" step="' + step + '" data-pq="' + esc(it.id) +
+      '" value="' + (pricingInputs.qty[it.id] || "") + '" placeholder="0" aria-label="' + esc(it.label) + '">' +
+      '<button type="button" data-pstep="' + esc(it.id) + '" data-d="1" ' +
+      'aria-label="One more ' + esc(it.label) + '">+</button></span>' +
+    '<span class="price ancfee"><input type="number" min="' + it.range.min + '" max="' + it.range.max +
+      '" step="1" data-pfee="' + esc(it.id) + '" value="' + (typed === undefined || typed === null || typed === "" ? "" : Math.round(it.price)) +
+      '" placeholder="' + Math.round(it.std) + '" title="Fee, between ' + money(it.range.min) + " and " + money(it.range.max) +
+      '" aria-label="Fee for ' + esc(it.label) + '">' + per + "</span>" +
+    '<span class="amt" data-pamt="' + it.i + '">' + amt(amount) + "</span></div>";
+}
+
 /* A group of sections — Upfront, Ongoing, Payable separately — with the total
    it adds up to, so the two numbers that matter are named in large type right
    where their lines start. */
@@ -6448,18 +6551,20 @@ function pricingAdviceView(p) {
      covering advice and accounting is one conversation. Split by how often each
      is charged — the two numbers are not addable — and each half only appears
      if something is set up for it. */
-  const ancRows = yearly => a.items.filter(i => i.section === ANCILLARY && (i.kind === "year") === yearly);
+  /* One block per service area, its sections as subheadings and its pricing
+     notes underneath — laid out like the area's own fee guide. */
   if (a.ancSet) {
-    const outside = "Coastal's other services, priced separately from advice. <strong>Outside both totals above</strong> " +
-      "&mdash; the service package and the FUM percentage are measured on the advice fee alone.";
-    if (ancRows(false).length) {
-      html += rowSection("Ancillary services — one-off", "ptAncOnce", a.ancOnce,
-        ancRows(false).map(priceRow).join(""), outside);
-    }
-    if (ancRows(true).length) {
-      html += rowSection("Ancillary services — every year", "ptAncYear", a.ancYear,
-        ancRows(true).map(priceRow).join(""),
-        ancRows(false).length ? "Charged every year for as long as the service runs." : outside);
+    for (const ar of a.ancAreas) {
+      const body = ar.groups.map(g =>
+        (g.name ? '<div class="ancgrp">' + esc(g.name) + "</div>" : "") + g.items.map(ancRow).join("")).join("");
+      const notes = ar.notes.split(/\r?\n/).map(s => s.replace(/^\s*[•*\-–]\s*/, "").trim()).filter(Boolean);
+      html += '<div class="rowsec anc"><div class="rowsec-h"><span class="t">' + esc(ar.name) + "</span>" +
+        (ar.gst ? '<span class="gst">incl. GST</span>' : "") +
+        '<span class="tot" data-anctot="' + ar.k + '">' + ancAreaTotal(ar) + "</span></div>" + body +
+        '<div class="secnote small muted">' +
+        (notes.length ? "<strong>Pricing notes</strong><ul class=\"ancnotes\">" +
+          notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul>" : "") +
+        "Priced separately from advice and <strong>outside both totals above</strong>.</div></div>";
     }
   }
 
@@ -6705,7 +6810,22 @@ function buildAdviceReport(info) {
     separate += pqLine("Centrelink administration", money(a.centrelink),
       { q: esc(basis + (pricingInputs.meansTested ? ", means tested" : "")) });
   }
-  separate += a.items.filter(i => i.section === ANCILLARY).map(i => lineOf(i)).join("");
+  /* Coastal's other services get a block per area, laid out like its fee
+     guide: area, then each section that has a line in use. */
+  let other = "";
+  for (const ar of a.ancAreas) {
+    let block = "";
+    for (const g of ar.groups) {
+      const lines = g.items.map(i => lineOf(i)).join("");
+      if (lines) block += (g.name ? '<div class="pq-sub">' + esc(g.name) + "</div>" : "") + lines;
+    }
+    if (block) {
+      other += "<h2><span>" + esc(ar.name) + (ar.gst ? ' <span class="pq-gst">incl. GST</span>' : "") + "</span>" +
+        ' <span class="tot" style="text-transform:none">' + ancAreaTotal(ar) + "</span></h2>" + block;
+      const notes = ar.notes.split(/\r?\n/).map(s => s.replace(/^\s*[•*\-–]\s*/, "").trim()).filter(Boolean);
+      if (notes.length) other += '<div class="pq-ancnotes">' + notes.map(n => "<div>&bull; " + esc(n) + "</div>").join("") + "</div>";
+    }
+  }
 
   const body =
     pqFigs([
@@ -6729,6 +6849,8 @@ function buildAdviceReport(info) {
         (a.centrelink > 0 ? " Centrelink administration is paid by direct debit or invoice and sits outside the Client Service Agreement." : "") +
         "</div>"
       : "") +
+    other +
+    (other ? '<div class="pq-hint" style="margin-top:4px">Other services are priced separately and are not included in the advice totals.</div>' : "") +
     pqNotes(info.notes);
 
   return pqShell("Advice Fee Summary", info.client,
@@ -6904,8 +7026,7 @@ function paintPricing() {
     set("#ptPkgAmt", money(a.packAmount));
   }
   set("#ptCentrelink", money(a.centrelink));
-  set("#ptAncOnce", money(a.ancOnce));
-  set("#ptAncYear", money(a.ancYear));
+  for (const ar of a.ancAreas) set('[data-anctot="' + ar.k + '"]', ancAreaTotal(ar));
 
   /* The headline figures in the pinned panel move with every keystroke too. */
   const vals = document.querySelectorAll(".quote-grid .v");
@@ -7171,6 +7292,134 @@ function viewRateCard() {
 const priceVal = v => (v === "" || v === null || v === undefined) ? null : num(v);
 const priceBox = v => (v === null || v === undefined) ? "" : v;
 
+/* The Ancillary services card on Settings: one block per area, each with its
+   GST tick, pricing notes and services table. `anc` is [{ it, i }] — i is the
+   line's index in p.items, which is what the editing handlers write back to. */
+function ancSettingsBody(p, anc, ro, del) {
+  const areas = p.ancAreas || [];
+  const areaNames = areas.map(a => String(a.name || "").trim());
+  const blocks = areas.map((a, k) => ({ a, k, name: areaNames[k] }));
+  /* Services whose area is not on the list — older lines, or a renamed area —
+     still show, under Other services, with the Area dropdown to move them. */
+  const orphans = anc.filter(x => !areaNames.includes(String(x.it.area || "").trim()));
+  if (orphans.length) blocks.push({ a: null, k: -1, name: ANC_NO_AREA, orphans });
+  if (!blocks.length) return '<div class="muted">No ancillary services set, so nothing extra appears on the calculator. ' +
+    "Add an area to start, or load one from a fee guide.</div>";
+
+  const areaSel = (it, i) => '<select class="w110" data-pe="item" data-i="' + i + '" data-f="area"' + ro + ">" +
+    (areaNames.includes(String(it.area || "").trim()) ? "" : '<option value="" selected>(none)</option>') +
+    areaNames.map(n => '<option value="' + esc(n) + '"' + (String(it.area || "").trim() === n ? " selected" : "") + ">" +
+      esc(n) + "</option>").join("") + "</select>";
+  const box = (i, f, v, ph, cls) => '<input type="number" class="' + (cls || "w90") + ' num" data-pe="item" data-i="' + i +
+    '" data-f="' + f + '" value="' + priceBox(v) + '" placeholder="' + (ph || "") + '"' + ro + ">";
+
+  return blocks.map(({ a, k, name, orphans: or }) => {
+    const rows = or || anc.filter(x => String(x.it.area || "").trim() === name);
+    const groups = [...new Set(rows.map(x => String(x.it.group || "").trim()).filter(Boolean))];
+    const listId = "ancgrp-" + (k < 0 ? "x" : k);
+    let h = '<div class="ancset">' +
+      '<div class="ancset-h">' +
+      (a ? '<input type="text" class="w180" data-pe="area" data-i="' + k + '" data-f="name" value="' + esc(a.name || "") +
+             '" placeholder="Accounting" aria-label="Area name"' + ro + ">" +
+           '<label class="small"><input type="checkbox" data-pe="areaBool" data-i="' + k + '" data-f="gst"' +
+             (a.gst ? " checked" : "") + ro + "> prices include GST</label>" +
+           '<span class="small muted">' + rows.length + " service" + (rows.length === 1 ? "" : "s") + "</span>" +
+           (ro ? "" : '<span class="spacer-x"></span><button class="btn ghost btn-sm" data-peadd="anc" data-area="' + esc(a.name || "") +
+             '">Add service</button> <button class="btn ghost btn-sm" data-pedelarea="' + k + '">Remove area</button>')
+         : "<strong>" + esc(name) + '</strong><span class="small muted">not in an area &mdash; pick one with the Area dropdown</span>') +
+      "</div>";
+    if (a) {
+      h += '<div class="field"><label>Pricing notes &mdash; one a line, shown under the area and on the PDF</label>' +
+        '<textarea rows="3" data-pe="area" data-i="' + k + '" data-f="notes"' + ro + ">" + esc(a.notes || "") + "</textarea></div>";
+    }
+    h += '<datalist id="' + listId + '">' + groups.map(g => '<option value="' + esc(g) + '">').join("") + "</datalist>";
+    h += rows.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Section</th><th>Service</th><th>Charged</th>' +
+        '<th class="num">Guide from</th><th class="num">Guide to</th><th class="num">NEW</th><th>Same</th>' +
+        '<th class="num">EXISTING</th><th>Note on the quote</th><th>Area</th>' +
+        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+        rows.map(({ it, i }) => {
+          const r = ancRange(it);
+          const out = r && [it.newPrice, it.same ? null : it.existingPrice]
+            .some(v => priceVal(v) !== null && (priceVal(v) < r.min || priceVal(v) > r.max));
+          const half = priceVal(it.rangeMin) !== null && priceVal(it.rangeMax) !== null && !r;
+          return "<tr>" +
+            '<td><input type="text" class="w160" list="' + listId + '" data-pe="item" data-i="' + i + '" data-f="group" value="' +
+              esc(it.group || "") + '" placeholder="Individual tax returns"' + ro + "></td>" +
+            '<td><input type="text" class="grow-x" style="min-width:260px" data-pe="item" data-i="' + i + '" data-f="label" value="' +
+              esc(it.label || "") + '" placeholder="Individual return — standard"' + ro + ">" +
+              (out ? '<div><span class="pill warn">fee outside the guide range</span></div>' : "") +
+              (half ? '<div><span class="pill warn">guide range: "to" must be above "from"</span></div>' : "") + "</td>" +
+            '<td><select class="w100" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
+              ANCILLARY_KINDS.map(kd => '<option value="' + kd + '"' + (it.kind === kd ? " selected" : "") + ">" +
+                ANCILLARY_LABEL[kd] + "</option>").join("") + "</select></td>" +
+            '<td class="num">' + box(i, "rangeMin", it.rangeMin, "optional") + "</td>" +
+            '<td class="num">' + box(i, "rangeMax", it.rangeMax, "optional") + "</td>" +
+            '<td class="num">' + box(i, "newPrice", it.newPrice, "n/a") + "</td>" +
+            '<td><input type="checkbox" data-pe="itemBool" data-i="' + i + '" data-f="same" title="Existing clients pay the NEW price"' +
+              (it.same ? " checked" : "") + ro + "></td>" +
+            '<td class="num">' + (it.same ? '<span class="small muted">as NEW</span>' : box(i, "existingPrice", it.existingPrice, "n/a")) + "</td>" +
+            '<td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="note" value="' +
+              esc(it.note || "") + '" placeholder="optional"' + ro + "></td>" +
+            "<td>" + areaSel(it, i) + "</td>" +
+            del("item", i) + "</tr>";
+        }).join("") + "</tbody></table></div>"
+      : '<div class="muted small">No services in this area yet.</div>';
+    return h + "</div>";
+  }).join("");
+}
+
+/* Reads a fee guide pasted as text — copied out of the PDF, or out of Excel —
+   into sections, services and pricing notes. A line ending in dollar figures is
+   a service: the first figure is the fee, the next two the guide range. A line
+   with no figures is a section heading, until "Pricing notes", after which
+   every line is a note. Anything it cannot read is listed rather than guessed. */
+function parseFeeGuide(text) {
+  const out = { services: [], notes: [], skipped: [], gst: /incl(uding|\.)?\s*gst/i.test(text) };
+  let group = "", inNotes = false;
+  const nums = s => (s.match(/\d[\d,]*(?:\.\d+)?/g) || []).map(x => num(x.replace(/,/g, "")));
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.replace(/ /g, " ").trim();
+    if (!line) continue;
+    if (/^pricing notes?\b/i.test(line)) { inNotes = true; continue; }
+    if (inNotes) {
+      const bullet = /^[•*\-–]\s*/.test(line);
+      const t = line.replace(/^[•*\-–]\s*/, "").trim();
+      if (!bullet && out.notes.length) out.notes[out.notes.length - 1] += " " + t;   // a wrapped line
+      else if (t) out.notes.push(t);
+      continue;
+    }
+    let label = null, figs = [];
+    if (line.includes("\t")) {
+      const cells = line.split("\t").map(c => c.trim());
+      const at = cells.findIndex((c, n) => n > 0 && /\d/.test(c));
+      if (at > 0) { label = cells.slice(0, at).join(" ").trim(); figs = nums(cells.slice(at).join(" ")); }
+    } else {
+      const m = line.match(/^(.*?)\s+(\$[\d$,.\s–—-]*)$/);
+      if (m) { label = m[1].trim(); figs = nums(m[2]); }
+    }
+    if (label && figs.length) {
+      const svc = { group, label, fee: figs[0], min: null, max: null,
+                    kind: /per\s*h(ou)?r|hourly/i.test(label) ? "hour" : "each" };
+      if (figs.length >= 3) { svc.min = figs[1]; svc.max = figs[2]; }
+      else if (figs.length === 2) { svc.min = figs[0]; svc.max = figs[1]; }
+      out.services.push(svc);
+      continue;
+    }
+    /* Column headings and the guide's own title lines are not sections. */
+    if (/standard fee|guide range|^service\b/i.test(line)) continue;
+    if (/\d/.test(line) && !/^[A-Z0-9 &,\/+()—–-]+$/.test(line)) { out.skipped.push(line); continue; }
+    group = line.replace(/\s+/g, " ");
+    if (group === group.toUpperCase()) {
+      group = group.toLowerCase().replace(/(^|[\s(\/&+\-])([a-z])/g, (s, a, b) => a + b.toUpperCase())
+        .replace(/\b(Smsf|Bas|Asic|Gst)\b/g, w => w.toUpperCase())
+        .replace(/\b(And|Or|Of|The|For)\b/g, w => w.toLowerCase());
+    }
+  }
+  /* Headings with no services under them were titles, not sections. */
+  return out;
+}
+
 function newItemId(items) {
   let n = 1;
   const taken = new Set(items.map(i => i.id));
@@ -7253,30 +7502,18 @@ function pricingSections(ro) {
     { key: "p-anc", title: "Ancillary services",
       sub: "Coastal's other services — accounting, lending and the like",
       meta: anc.length + " service" + (anc.length === 1 ? "" : "s"),
-      actions: addBtn('data-peadd="anc"', "Add service"),
-      body: () =>
-        (anc.length
-          ? '<div class="tbl-scroll"><table><thead><tr><th>Service</th><th>Charged</th>' +
-            '<th class="num">NEW</th><th class="num">EXISTING</th><th>Note on the quote</th>' +
-            (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
-            anc.map(({ it, i }) =>
-              '<tr><td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="label" value="' +
-                esc(it.label || "") + '" placeholder="Accounting"' + ro + "></td>" +
-              '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
-                ANCILLARY_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
-                  ANCILLARY_LABEL[k] + "</option>").join("") + "</select></td>" +
-              '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
-                '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
-              '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
-                '" data-f="existingPrice" value="' + priceBox(it.existingPrice) + '" placeholder="n/a"' + ro + "></td>" +
-              '<td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="note" value="' +
-                esc(it.note || "") + '" placeholder="optional"' + ro + "></td>" +
-              del("item", i) + "</tr>").join("") + "</tbody></table></div>"
-          : '<div class="muted">No ancillary services set, so the section does not appear on the calculator.</div>') +
+      actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px">' +
+        '<button class="btn ghost btn-sm" data-peadd="ancArea">Add area</button> ' +
+        '<button class="btn ghost btn-sm" id="btnAncLoad">Load services from a fee guide</button></div>',
+      body: () => ancSettingsBody(p, anc, ro, del) +
         '<div class="spacer"></div><div class="small muted">These are services Coastal provides and bills for, quoted ' +
-        "alongside advice but priced on their own. <strong>One-off</strong> and <strong>hourly</strong> are counted by the " +
-        "adviser; <strong>ongoing</strong> is charged every year for as long as the service runs." +
-        "<br><br>An empty price box means the service is <strong>not offered</strong> to that client type &mdash; different " +
+        "alongside advice but priced on their own. Each <strong>area</strong> (Accounting, Lending) is its own block at the " +
+        "bottom of the calculator, with its <strong>sections</strong> as subheadings and its pricing notes underneath. " +
+        "<strong>One-off</strong> and <strong>hourly</strong> are counted by the adviser; <strong>ongoing</strong> is charged " +
+        "every year for as long as the service runs." +
+        "<br><br><strong>Guide range</strong> is optional. With one set, the adviser can type their own fee on the calculator, " +
+        "but only inside the range; without one, the fee is fixed. Tick <strong>Same</strong> to charge existing clients the NEW " +
+        "price. An empty price box means the service is <strong>not offered</strong> to that client type &mdash; different " +
         "from a price of zero. The note prints under the service name on the quote, which is the place to say what triggers " +
         "the fee or what it covers." +
         "<br><br>They sit <strong>outside Total upfront and Total ongoing</strong>, on purpose: the service package is chosen " +
@@ -8210,6 +8447,22 @@ function wire() {
       if (box) box.value = next || "";
       paintPricing();
     }));
+  /* A fee typed inside a guide range. Priced at the range's edge while it is
+     outside it, and put back to that edge when the box is left. */
+  document.querySelectorAll("[data-pfee]").forEach(el => {
+    el.addEventListener("input", () => { pricingInputs.fee[el.dataset.pfee] = el.value; paintPricing(); });
+    el.addEventListener("change", () => {
+      const it = priceAdvice().items.find(x => x.id === el.dataset.pfee);
+      if (!it || !it.range || el.value === "") { if (el.value === "") delete pricingInputs.fee[el.dataset.pfee]; paintPricing(); return; }
+      const v = num(el.value);
+      if (v < it.range.min || v > it.range.max) {
+        el.value = Math.round(it.price);
+        toast("Kept inside the guide range, " + money(it.range.min) + " to " + money(it.range.max) + ".", "bad");
+      }
+      pricingInputs.fee[el.dataset.pfee] = el.value;
+      paintPricing();
+    });
+  });
   document.querySelectorAll("[data-pf]").forEach(el =>
     el.addEventListener(el.tagName === "SELECT" ? "change" : "input", () => {
       pricingInputs[el.dataset.pf] = el.dataset.pf === "rateIdx" ? parseInt(el.value, 10) || 0 : num(el.value);
@@ -8228,18 +8481,33 @@ function wire() {
 
   /* --- pricing editor, on Rate/Fee Settings --- */
   const pr = () => state.rateCard.pricing || (state.rateCard.pricing = JSON.parse(JSON.stringify(EMPTY_PRICING)));
-  const PE_TEXT = ["label", "name", "title", "body", "kind", "note", "reviewed"];
+  const PE_TEXT = ["label", "name", "title", "body", "kind", "note", "reviewed", "area", "group", "notes"];
 
   document.querySelectorAll("[data-pe]").forEach(el =>
     el.addEventListener("change", () => {
       const p = pr(), i = +el.dataset.i, f = el.dataset.f;
       const v = PE_TEXT.includes(f) ? el.value
-        : (f === "newPrice" || f === "existingPrice") ? priceVal(el.value)
+        : (f === "newPrice" || f === "existingPrice" || f === "rangeMin" || f === "rangeMax") ? priceVal(el.value)
         : num(el.value);
       switch (el.dataset.pe) {
         case "scalar":      p[f] = v; break;
         case "item":        p.items[i][f] = v; break;
         case "itemBool":    p.items[i][f] = el.checked; break;
+        case "area": {
+          /* Renaming an area takes its services with it. */
+          const a = p.ancAreas[i];
+          if (f === "name") {
+            const was = String(a.name || "").trim(), now = String(v).trim();
+            if (!now) { toast("An area needs a name.", "bad"); render(); return; }
+            if (p.ancAreas.some((x, n) => n !== i && String(x.name || "").trim() === now)) {
+              toast("There is already an area called " + now + ".", "bad"); render(); return;
+            }
+            for (const it of p.items) if (it.section === ANCILLARY && String(it.area || "").trim() === was) it.area = now;
+            a.name = now;
+          } else a[f] = v;
+          break;
+        }
+        case "areaBool":    p.ancAreas[i][f] = el.checked; break;
         case "ladder":      p.ladders[el.dataset.ct][i][f] = v; break;
         case "pack":        p.packages[i][f] = v; break;
         case "noCsa":       p.noCsa[f] = v; break;
@@ -8263,10 +8531,22 @@ function wire() {
                          kind: el.dataset.sec === "hourly" ? "hour" : "each",
                          newPrice: 0, existingPrice: 0, suppressesMin: false, note: "" });
           break;
-        case "anc":
-          p.items.push({ id: newItemId(p.items), section: ANCILLARY, label: "New service",
-                         kind: "each", newPrice: 0, existingPrice: 0, suppressesMin: false, note: "" });
+        case "anc": {
+          /* Lands in the area it was added from, under that area's last section. */
+          const area = el.dataset.area || "";
+          const last = [...p.items].reverse().find(it => it.section === ANCILLARY && (it.area || "") === area);
+          p.items.push({ id: newItemId(p.items), section: ANCILLARY, label: "New service", area,
+                         group: last ? last.group || "" : "", kind: "each", newPrice: 0, existingPrice: null,
+                         same: true, rangeMin: null, rangeMax: null, suppressesMin: false, note: "" });
           break;
+        }
+        case "ancArea": {
+          p.ancAreas = p.ancAreas || [];
+          let name = "New area", n = 1;
+          while (p.ancAreas.some(x => x.name === name)) name = "New area " + (++n);
+          p.ancAreas.push({ name, gst: true, notes: "" });
+          break;
+        }
         case "ladder":
           (p.ladders[el.dataset.ct] = p.ladders[el.dataset.ct] || [])
             .push({ from: above(p.ladders[el.dataset.ct], 500000), rate: 0 });
@@ -8299,6 +8579,69 @@ function wire() {
       saveRateCard(); render();
     }));
 
+  /* Removing an area takes its services with it, so it says how many first. */
+  document.querySelectorAll("[data-pedelarea]").forEach(el =>
+    el.addEventListener("click", () => {
+      const p = pr(), k = +el.dataset.pedelarea, a = (p.ancAreas || [])[k];
+      if (!a) return;
+      const name = String(a.name || "").trim();
+      const n = p.items.filter(it => it.section === ANCILLARY && String(it.area || "").trim() === name).length;
+      if (!confirm("Remove " + (name || "this area") + (n ? " and its " + n + " service" + (n === 1 ? "" : "s") : "") + "?")) return;
+      p.items = p.items.filter(it => !(it.section === ANCILLARY && String(it.area || "").trim() === name));
+      p.ancAreas.splice(k, 1);
+      saveRateCard(); render();
+    }));
+
+  /* Load an area from a fee guide pasted as text. Shows what it read before
+     anything is saved, and replaces only the services in the area named. */
+  if ($("#btnAncLoad")) $("#btnAncLoad").addEventListener("click", () => {
+    const p = pr();
+    const firstArea = ((p.ancAreas || [])[0] || {}).name || "Accounting";
+    showDialog("Load services from a fee guide",
+      '<p class="small muted">Open the fee guide PDF, select all of it, copy, and paste it below. A copy out of Excel ' +
+      "works too &mdash; service, fee, then the guide range from and to. Lines ending in dollar figures become services, " +
+      "lines in between become sections, and everything after <em>Pricing notes</em> becomes the area's notes.</p>" +
+      '<div class="field"><label>Area</label><input type="text" id="ancLoadArea" value="' + esc(firstArea) + '"></div>' +
+      '<div class="field"><label>Fee guide</label><textarea id="ancLoadText" rows="12" style="width:100%" class="mono"></textarea></div>' +
+      '<div id="ancLoadPreview" class="small muted">Paste to see what will be loaded.</div>',
+      "Load", () => {
+        const area = String(($("#ancLoadArea") || {}).value || "").trim();
+        const g = parseFeeGuide(($("#ancLoadText") || {}).value || "");
+        if (!area) { toast("Name the area first.", "bad"); return false; }
+        if (!g.services.length) { toast("No services found in that text, so nothing was changed.", "bad"); return false; }
+        const had = p.items.filter(it => it.section === ANCILLARY && String(it.area || "").trim() === area).length;
+        if (had && !confirm("This replaces the " + had + " service" + (had === 1 ? "" : "s") + " already in " + area + ". Carry on?")) return false;
+        p.items = p.items.filter(it => !(it.section === ANCILLARY && String(it.area || "").trim() === area));
+        for (const s of g.services) {
+          p.items.push({ id: newItemId(p.items), section: ANCILLARY, area, group: s.group, label: s.label,
+                         kind: s.kind, newPrice: s.fee, existingPrice: null, same: true,
+                         rangeMin: s.min, rangeMax: s.max, suppressesMin: false, note: "" });
+        }
+        p.ancAreas = p.ancAreas || [];
+        let a = p.ancAreas.find(x => String(x.name || "").trim() === area);
+        if (!a) p.ancAreas.push(a = { name: area, gst: g.gst, notes: "" });
+        if (g.notes.length) a.notes = g.notes.join("\n");
+        if (g.gst) a.gst = true;
+        pricingInputs.qty = {}; pricingInputs.fee = {};
+        saveRateCard(); render();
+        toast(g.services.length + " services loaded into " + area + ".", "good");
+      });
+    /* A live read-back, so a bad paste is seen before it is saved. */
+    const box = $("#ancLoadText"), prev = $("#ancLoadPreview");
+    if (box && prev) box.addEventListener("input", () => {
+      const g = parseFeeGuide(box.value);
+      const secs = [...new Set(g.services.map(s => s.group))];
+      prev.innerHTML = g.services.length
+        ? "<strong>" + g.services.length + " services</strong> in " + secs.length + " section" + (secs.length === 1 ? "" : "s") +
+          (secs.filter(Boolean).length ? " (" + esc(secs.filter(Boolean).join(", ")) + ")" : "") +
+          ", " + g.services.filter(s => s.min !== null).length + " with a guide range, " +
+          g.notes.length + " pricing note" + (g.notes.length === 1 ? "" : "s") + (g.gst ? ", prices include GST" : "") + "." +
+          (g.skipped.length ? '<div class="pill warn" style="margin-top:6px;white-space:normal">Not read: ' +
+            esc(g.skipped.slice(0, 4).join(" · ")) + (g.skipped.length > 4 ? " …" : "") + "</div>" : "")
+        : "Nothing recognised yet.";
+    });
+  });
+
   if ($("#btnPriceCopy")) $("#btnPriceCopy").addEventListener("click", () =>
     navigator.clipboard.writeText(JSON.stringify(pricing(), null, 2)).then(
       () => toast("Pricing copied as JSON."),
@@ -8330,6 +8673,7 @@ function wire() {
           seen.add(it.id);
         }
         pricingInputs.qty = {};
+        pricingInputs.fee = {};
         saveRateCard(); render();
         toast(state.rateCard.pricing.items.length + " pricing lines loaded.", "good");
       }));
