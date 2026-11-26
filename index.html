@@ -322,7 +322,7 @@ td input.num{text-align:right}
 .w100,select.w100{width:108px}
 .w160,input.w160{width:170px}
 .w180,input.w180{width:200px}
-/* One ancillary area on Settings. */
+/* One specialist services area on Settings. */
 .ancset{border:1px solid var(--line);border-radius:var(--r-lg);padding:12px 14px;margin-bottom:14px}
 .ancset-h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
 .ancset-h .spacer-x{flex:1}
@@ -499,7 +499,7 @@ td input.num{text-align:right}
 .rrow .amt{font-variant-numeric:tabular-nums;font-size:.92rem;min-width:86px;text-align:right}
 .rrow.off .lbl,.rrow.off .amt{color:var(--ink-muted)}
 .secnote{margin-top:11px}
-/* Ancillary areas: section subheadings, the fee box inside a guide range, the
+/* Specialist services areas: section subheadings, the fee box inside a guide range, the
    GST tag on the rule, and the area's pricing notes. */
 .ancgrp{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;font-weight:700;color:var(--s1);
   padding:12px 2px 4px;border-bottom:1px solid var(--line)}
@@ -980,7 +980,9 @@ const EXPECTED_SCHEMA = {
    an insurance-only engagement does not also carry the base SOA fee. */
 const PRICE_KINDS = ["min", "each", "hour"];
 
-/* Coastal's other services — accounting, lending and the like. They are priced
+/* Specialist services — accounting, lending and the like. The stored section
+   value stays "ancillary" (the name they had first) so saved rate cards still
+   load; everything people see says Specialist services. They are priced
    lines like any other and live in the same `items` list under their own
    section, but they are quoted the three ways the business sells them rather
    than the three ways an advice fee is built. `year` is arithmetically `each`:
@@ -999,9 +1001,9 @@ const ANCILLARY_LABEL = { each: "one-off", hour: "hourly", year: "ongoing" };
 const EMPTY_PRICING = {
   reviewed: "",                       // "30 June 2026", shown on the screen
   items: [],                          // { id, section, label, kind, newPrice, existingPrice, suppressesMin, note }
-                                      // ancillary lines add: area, group, same, rangeMin, rangeMax
-  /* Ancillary service areas — Accounting, Lending — in the order they show on
-     the calculator, each with its GST wording and pricing notes (one a line). */
+                                      // specialist lines add: area, group, same, rangeMin, rangeMax
+  /* Specialist service areas — Accounting, Lending — in the order their tabs
+     show on the calculator, each with its GST wording and pricing notes (one a line). */
   ancAreas: [],                       // { name, gst, notes }
   /* Marginal FUM bands, one ladder per client type, in the same {from, rate}
      shape the surcharge bands use so surchargeFor() prices both. */
@@ -5805,10 +5807,10 @@ const pricing = () => (state.rateCard && state.rateCard.pricing) || EMPTY_PRICIN
 /* Held in memory on purpose. A FUM figure typed in here is client information
    and has no business in localStorage. */
 const pricingInputs = {
-  tab: "advice",              // "advice" | "claims"
+  tab: "advice",              // "advice" | "claims" | "area:<specialist area name>"
   clientType: "EXISTING",
   qty: {},                    // item id -> count, or hours for an hourly line
-  fee: {},                    // ancillary item id -> fee typed within its guide range
+  fee: {},                    // specialist service id -> fee typed within its guide range
   fum: 0,
   onAgreement: true,
   meansTested: false,
@@ -5843,7 +5845,7 @@ function priceAdvice() {
   const p = pricing();
   const ct = pricingInputs.clientType;
   const items = (p.items || []).map((it, i) => {
-    /* An ancillary service can carry one price for both client types. */
+    /* A specialist service can carry one price for both client types. */
     const raw = (ct === "NEW" || (it.section === ANCILLARY && it.same)) ? it.newPrice : it.existingPrice;
     let price = (raw === null || raw === undefined || raw === "") ? null : num(raw);
     const std = price;
@@ -5913,17 +5915,8 @@ function priceAdvice() {
   const sum = s => items.filter(i => i.section === s).reduce((a, i) => a + i.amount, 0);
   const soa = sum("soa"), impl = sum("impl"), csa = sum("csa") + packAmount, hourly = sum("hourly");
 
-  /* Ancillary splits by how often it is charged rather than by section, because
-     a one-off lending fee and an annual accounting retainer are two different
-     numbers and adding them together would be arithmetic nobody asked for.
-     `ancSet` is whether any are configured at all — the section and its card
-     appear on that, not on whether a quantity has been typed, so the figures
-     can repaint in place instead of the card arriving mid-keystroke. */
-  const ancSum = yearly => items
-    .filter(i => i.section === ANCILLARY && (i.kind === "year") === yearly)
-    .reduce((a, i) => a + i.amount, 0);
-  const ancOnce = ancSum(false), ancYear = ancSum(true);
-  const ancSet = items.some(i => i.section === ANCILLARY);
+  /* Specialist services are priced on their own tab per area, never in the
+     advice totals. Each area totals one-off and yearly money separately. */
   const ancAreas = ancAreasOf(p, items.filter(i => i.section === ANCILLARY));
 
   const ongoing = csa + fumFee;
@@ -5941,7 +5934,7 @@ function priceAdvice() {
 
   return { items, soa, impl, csa, hourly, ladder, fum, fumFee, ongoing, upfront,
            pack, packBand, packFee, packLift, packAmount, minTotal,
-           centrelink, packs, ancOnce, ancYear, ancSet, ancAreas,
+           centrelink, packs, ancAreas,
            pctOfFum: fum > 0 ? ongoing / fum : null };
 }
 
@@ -5953,7 +5946,7 @@ function ancRange(it) {
   return (lo !== null && hi !== null && hi > lo) ? { min: lo, max: hi } : null;
 }
 
-/* Ancillary lines grouped for the screen and the report: area, then section,
+/* Specialist service lines grouped for the screen and the report: area, then section,
    in the order they were entered. Areas follow the settings list; a service
    with no area falls under "Other services" at the end. */
 const ANC_NO_AREA = "Other services";
@@ -6019,22 +6012,32 @@ const quoteCard = (k, v, n) =>
   '<div class="n">' + esc(n || "") + "</div></div>";
 const quoteHead = cells => '<div class="quote-head"><div class="quote-grid">' + cells + "</div></div>";
 
-/* One card carrying two different kinds of money. Leading with whichever is
-   actually on the quote beats showing $0 beside a real annual figure, so a
-   client with only a retainer sees the retainer. Shared with paintPricing() so
-   the pinned panel and a rebuild cannot word it differently. */
-function ancCard(a) {
-  const yearOnly = !a.ancOnce && a.ancYear;
-  return {
-    v: money(yearOnly ? a.ancYear : a.ancOnce),
-    n: yearOnly ? "per year, outside both totals"
-      : a.ancYear ? "plus " + money(a.ancYear) + " per year"
-      : "one-off, outside both totals"
-  };
+/* The specialist area a tab points at, or null on the advice and claims tabs —
+   and null too when the area has since been renamed or removed. */
+const areaOfTab = a => String(pricingInputs.tab).startsWith("area:")
+  ? (a.ancAreas.find(ar => "area:" + ar.name === pricingInputs.tab) || null) : null;
+
+/* The pinned figures on a specialist tab. Which cards show depends on how the
+   area is set up, never on what has been typed, so paintPricing() can update
+   them by position. Shared with the report so the two cannot disagree. */
+function areaFigures(ar) {
+  const hasYear = ar.items.some(i => i.kind === "year");
+  const used = ar.items.filter(i => lineAmount(i) !== null).length;
+  const figs = [[hasYear ? "One-off fees" : "Total fees", money(ar.once), ar.gst ? "incl. GST" : ""]];
+  if (hasYear) figs.push(["Per year", money(ar.year), "ongoing"]);
+  figs.push(["Services", String(used), used === 1 ? "service selected" : "services selected"]);
+  return figs;
 }
 
+/* Whether NEW and EXISTING clients can pay different prices in an area — if
+   every service is ticked Same, the client type toggle has nothing to do. */
+const areaHasTypes = ar => ar.items.some(i => !i.same);
+
+/* An area's pricing notes, one per line, bullets stripped. */
+const areaNotes = ar => ar.notes.split(/\r?\n/).map(s => s.replace(/^\s*[•*\-–]\s*/, "").trim()).filter(Boolean);
+
 const pricingTabBtn = (id, label) =>
-  '<button class="btn' + (pricingInputs.tab === id ? "" : " ghost") + '" data-ptab="' + id + '">' + esc(label) + "</button>";
+  '<button class="btn' + (pricingInputs.tab === id ? "" : " ghost") + '" data-ptab="' + esc(id) + '">' + esc(label) + "</button>";
 
 /* =========================================================================
    CSA Tracker
@@ -6312,11 +6315,17 @@ function viewPricing() {
       : "<strong>No pricing loaded yet.</strong> A Manager or Admin sets this up on the Rate/Fee Settings screen.") +
       "</div>";
   }
+  /* Each specialist services area gets its own tab after the two of ours. */
+  const a = priceAdvice();
+  if (String(pricingInputs.tab).startsWith("area:") && !areaOfTab(a)) pricingInputs.tab = "advice";
   html += '<div class="toggle-row no-print" style="margin-bottom:16px">' +
     pricingTabBtn("advice", "Advice fees") + pricingTabBtn("claims", "Insurance claims") +
+    a.ancAreas.map(ar => pricingTabBtn("area:" + ar.name, ar.name)).join("") +
     /* One report per tab: whichever is showing is what gets printed. */
     '<button class="btn ghost" id="btnPricingReport" style="margin-left:auto">Report / PDF</button></div>';
-  return html + (pricingInputs.tab === "claims" ? pricingClaimsView(p) : pricingAdviceView(p));
+  const ar = areaOfTab(a);
+  return html + (pricingInputs.tab === "claims" ? pricingClaimsView(p)
+    : ar ? pricingAreaView(ar) : pricingAdviceView(p));
 }
 
 /* A line nobody has touched has no amount, and printing $0 against eighteen of
@@ -6412,7 +6421,7 @@ function priceRow(it) {
     '<span class="amt" data-pamt="' + it.i + '">' + amt(amount) + "</span></div>";
 }
 
-/* An ancillary line: a priceRow, except that a service with a guide range has
+/* A specialist service line: a priceRow, except that a service with a guide range has
    its fee in a box the adviser can type over — held to the range — with the
    range shown beside the name. Without a range the fee is fixed. */
 function ancRow(it) {
@@ -6472,10 +6481,7 @@ function pricingAdviceView(p) {
     quoteCard("Fee as % of FUM", a.pctOfFum === null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%",
               a.fum > 0 ? "on " + money(a.fum) : "enter FUM below") +
     quoteCard("Service package", a.pack ? a.pack.name : "—",
-              packCardNote(a)) +
-    /* Shown whenever ancillary services exist, not whenever one is used: a card
-       that appears halfway through typing moves everything beside it. */
-    (a.ancSet ? quoteCard("Ancillary services", ancCard(a).v, ancCard(a).n) : ""));
+              packCardNote(a)));
 
   /* The two inputs that move nearly every figure, lifted out of the sections
      they used to be buried in. */
@@ -6547,29 +6553,40 @@ function pricingAdviceView(p) {
     "</strong>. Payable personally by direct debit or invoice, never included in the Client Service Agreement, " +
     "and not part of either total above.");
 
-  /* Coastal's other services, at the bottom and on the same screen, so a quote
-     covering advice and accounting is one conversation. Split by how often each
-     is charged — the two numbers are not addable — and each half only appears
-     if something is set up for it. */
-  /* One block per service area, its sections as subheadings and its pricing
-     notes underneath — laid out like the area's own fee guide. */
-  if (a.ancSet) {
-    for (const ar of a.ancAreas) {
-      const body = ar.groups.map(g =>
-        (g.name ? '<div class="ancgrp">' + esc(g.name) + "</div>" : "") + g.items.map(ancRow).join("")).join("");
-      const notes = ar.notes.split(/\r?\n/).map(s => s.replace(/^\s*[•*\-–]\s*/, "").trim()).filter(Boolean);
-      html += '<div class="rowsec anc"><div class="rowsec-h"><span class="t">' + esc(ar.name) + "</span>" +
-        (ar.gst ? '<span class="gst">incl. GST</span>' : "") +
-        '<span class="tot" data-anctot="' + ar.k + '">' + ancAreaTotal(ar) + "</span></div>" + body +
-        '<div class="secnote small muted">' +
-        (notes.length ? "<strong>Pricing notes</strong><ul class=\"ancnotes\">" +
-          notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul>" : "") +
-        "Priced separately from advice and <strong>outside both totals above</strong>.</div></div>";
-    }
-  }
-
   html += "</div></div>";
   html += pricingReference(p);
+  return html;
+}
+
+/* A specialist services area on its own tab — Accounting, Lending — laid out
+   like the area's own fee guide: its sections as subheadings, a total on the
+   area's rule, and its pricing notes underneath. */
+function pricingAreaView(ar) {
+  const ct = pricingInputs.clientType;
+  let html = quoteHead(areaFigures(ar).map(f => quoteCard(f[0], f[1], f[2])).join(""));
+
+  /* Only when NEW and EXISTING can actually differ in this area. */
+  if (areaHasTypes(ar)) {
+    const typeBtn = t => '<button class="' + (ct === t ? "on" : "") + '" data-ptype="' + t +
+      '" aria-pressed="' + (ct === t) + '">' + t + "</button>";
+    html += '<div class="keys no-print">' +
+      '<div class="kb"><span class="k">Client type</span><span class="seg">' +
+        typeBtn("NEW") + typeBtn("EXISTING") + "</span></div>" +
+      '<div class="small muted keys-note">Existing includes anyone who came across through a merger ' +
+      "or acquisition.</div></div>";
+  }
+
+  const body = ar.groups.map(g =>
+    (g.name ? '<div class="ancgrp">' + esc(g.name) + "</div>" : "") + g.items.map(ancRow).join("")).join("");
+  const notes = areaNotes(ar);
+  html += '<div class="card"><div class="card-b">' +
+    '<div class="rowsec anc"><div class="rowsec-h"><span class="t">' + esc(ar.name) + "</span>" +
+    (ar.gst ? '<span class="gst">incl. GST</span>' : "") +
+    '<span class="tot" data-anctot="' + ar.k + '">' + ancAreaTotal(ar) + "</span></div>" + body +
+    '<div class="secnote small muted">' +
+    (notes.length ? "<strong>Pricing notes</strong><ul class=\"ancnotes\">" +
+      notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul>" : "") +
+    "Priced separately from advice fees.</div></div></div></div>";
   return html;
 }
 
@@ -6802,31 +6819,14 @@ function buildAdviceReport(info) {
     ongoing += pqLine("FUM fee", money(a.fumFee), { q: "on " + money(a.fum) }) + pqHint(bandHint(a.ladder, a.fum));
   }
 
-  /* Everything that is priced but sits outside both totals: hourly work,
-     Centrelink administration, and Coastal's other services. */
+  /* Everything that is priced but sits outside both totals: hourly work and
+     Centrelink administration. Specialist services print from their own tab. */
   let separate = used("hourly").map(i => lineOf(i)).join("");
   if (a.centrelink != null && a.centrelink > 0) {
     const basis = pricingInputs.onAgreement ? (a.pack ? a.pack.name + " package" : "") : "no Service Agreement";
     separate += pqLine("Centrelink administration", money(a.centrelink),
       { q: esc(basis + (pricingInputs.meansTested ? ", means tested" : "")) });
   }
-  /* Coastal's other services get a block per area, laid out like its fee
-     guide: area, then each section that has a line in use. */
-  let other = "";
-  for (const ar of a.ancAreas) {
-    let block = "";
-    for (const g of ar.groups) {
-      const lines = g.items.map(i => lineOf(i)).join("");
-      if (lines) block += (g.name ? '<div class="pq-sub">' + esc(g.name) + "</div>" : "") + lines;
-    }
-    if (block) {
-      other += "<h2><span>" + esc(ar.name) + (ar.gst ? ' <span class="pq-gst">incl. GST</span>' : "") + "</span>" +
-        ' <span class="tot" style="text-transform:none">' + ancAreaTotal(ar) + "</span></h2>" + block;
-      const notes = ar.notes.split(/\r?\n/).map(s => s.replace(/^\s*[•*\-–]\s*/, "").trim()).filter(Boolean);
-      if (notes.length) other += '<div class="pq-ancnotes">' + notes.map(n => "<div>&bull; " + esc(n) + "</div>").join("") + "</div>";
-    }
-  }
-
   const body =
     pqFigs([
       pqFig("Upfront", money(a.upfront), "SOA and implementation"),
@@ -6849,8 +6849,6 @@ function buildAdviceReport(info) {
         (a.centrelink > 0 ? " Centrelink administration is paid by direct debit or invoice and sits outside the Client Service Agreement." : "") +
         "</div>"
       : "") +
-    other +
-    (other ? '<div class="pq-hint" style="margin-top:4px">Other services are priced separately and are not included in the advice totals.</div>' : "") +
     pqNotes(info.notes);
 
   return pqShell("Advice Fee Summary", info.client,
@@ -6859,6 +6857,42 @@ function buildAdviceReport(info) {
     body,
     "All fees include GST. " + pricingReviewedLine() +
       " Final fees are confirmed in the Statement of Advice and Client Service Agreement.",
+    info.ref);
+}
+
+/* ---- specialist services, one area per report ---- */
+function buildAreaReport(info, ar) {
+  const ct = pricingInputs.clientType;
+  const lineOf = i => {
+    const v = lineAmount(i);
+    if (v == null) return "";
+    const n = +num(i.qty).toFixed(2);
+    const q = "× " + n + (i.kind === "hour" ? (n === 1 ? " hr" : " hrs") : "") + " at " + money(i.price) +
+      (i.kind === "hour" ? "/hr" : "");
+    return pqLine(esc(i.label), money(v) + (i.kind === "year" ? " /yr" : ""), { q: esc(q) });
+  };
+  let lines = "";
+  for (const g of ar.groups) {
+    const l = g.items.map(lineOf).join("");
+    if (l) lines += (g.name ? '<div class="pq-sub">' + esc(g.name) + "</div>" : "") + l;
+  }
+  const notes = areaNotes(ar);
+  const body =
+    pqFigs(areaFigures(ar).map(f => pqFig(f[0], f[1], f[2]))) +
+    "<h2><span>" + esc(ar.name) + (ar.gst ? ' <span class="pq-gst">incl. GST</span>' : "") + "</span>" +
+      ' <span class="tot" style="text-transform:none">' + ancAreaTotal(ar) + "</span></h2>" +
+    (lines || pqLine('<span class="pq-hint">No services selected</span>', "")) +
+    (lines ? pqLine("Total", ancAreaTotal(ar), { cls: "tot" }) : "") +
+    (notes.length ? '<div class="pq-ancnotes"><b>Pricing notes</b>' +
+      notes.map(n => "<div>&bull; " + esc(n) + "</div>").join("") + "</div>" : "") +
+    pqNotes(info.notes);
+
+  const meta = [["Xplan ID", info.xplan || "—"]];
+  if (areaHasTypes(ar)) meta.push(["Client type", ct === "NEW" ? "New" : "Existing"]);
+  meta.push(["Prepared by", info.by], ["Date", info.when]);
+  return pqShell(ar.name + " Fee Summary", info.client, meta, body,
+    (ar.gst ? "All fees include GST. " : "") + pricingReviewedLine() +
+      " Specialist services are priced separately from advice fees.",
     info.ref);
 }
 
@@ -6920,7 +6954,8 @@ function buildClaimsReport(info) {
    found again, which defeats the reason for printing it. */
 function openPricingReport() {
   const claims = pricingInputs.tab === "claims";
-  showDialog(claims ? "Insurance claim report" : "Advice fee report",
+  const area = areaOfTab(priceAdvice());
+  showDialog(claims ? "Insurance claim report" : area ? area.name + " fee report" : "Advice fee report",
     '<div class="field"><label>Client name</label><input type="text" id="pqClient" placeholder="Citizen, Jane &amp; John" autocomplete="off"></div>' +
     '<div class="field"><label>Xplan ID <span class="small muted">(optional)</span></label><input type="text" id="pqXplan" autocomplete="off"></div>' +
     '<div class="field"><label>Notes <span class="small muted">(optional, printed on the report)</span></label>' +
@@ -6939,7 +6974,9 @@ function openPricingReport() {
         when: new Date().toLocaleString("en-AU", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" }),
         ref: pricingRef()
       };
-      printPricingReport(claims ? buildClaimsReport(info) : buildAdviceReport(info));
+      /* Priced again at the moment of printing, so the page matches the screen. */
+      const ar = areaOfTab(priceAdvice());
+      printPricingReport(claims ? buildClaimsReport(info) : ar ? buildAreaReport(info, ar) : buildAdviceReport(info));
       return true;
     });
 }
@@ -7026,11 +7063,19 @@ function paintPricing() {
     set("#ptPkgAmt", money(a.packAmount));
   }
   set("#ptCentrelink", money(a.centrelink));
-  for (const ar of a.ancAreas) set('[data-anctot="' + ar.k + '"]', ancAreaTotal(ar));
 
   /* The headline figures in the pinned panel move with every keystroke too. */
   const vals = document.querySelectorAll(".quote-grid .v");
   const notes = document.querySelectorAll(".quote-grid .n");
+  const ar = areaOfTab(a);
+  if (ar) {
+    set('[data-anctot="' + ar.k + '"]', ancAreaTotal(ar));
+    areaFigures(ar).forEach((f, n) => {
+      if (vals[n]) vals[n].textContent = f[1];
+      if (notes[n]) notes[n].textContent = f[2];
+    });
+    return;
+  }
   if (vals.length >= 4) {
     vals[0].textContent = money(a.upfront);
     vals[1].textContent = money(a.ongoing);
@@ -7039,12 +7084,6 @@ function paintPricing() {
     if (notes.length >= 4) {
       notes[2].textContent = a.fum > 0 ? "on " + money(a.fum) : "enter FUM below";
       notes[3].textContent = packCardNote(a);
-    }
-    /* The fifth card is there only when ancillary services are set up. */
-    if (vals.length >= 5) {
-      const ac = ancCard(a);
-      vals[4].textContent = ac.v;
-      if (notes.length >= 5) notes[4].textContent = ac.n;
     }
   }
 }
@@ -7292,7 +7331,7 @@ function viewRateCard() {
 const priceVal = v => (v === "" || v === null || v === undefined) ? null : num(v);
 const priceBox = v => (v === null || v === undefined) ? "" : v;
 
-/* The Ancillary services card on Settings: one block per area, each with its
+/* The Specialist services card on Settings: one block per area, each with its
    GST tick, pricing notes and services table. `anc` is [{ it, i }] — i is the
    line's index in p.items, which is what the editing handlers write back to. */
 function ancSettingsBody(p, anc, ro, del) {
@@ -7303,7 +7342,7 @@ function ancSettingsBody(p, anc, ro, del) {
      still show, under Other services, with the Area dropdown to move them. */
   const orphans = anc.filter(x => !areaNames.includes(String(x.it.area || "").trim()));
   if (orphans.length) blocks.push({ a: null, k: -1, name: ANC_NO_AREA, orphans });
-  if (!blocks.length) return '<div class="muted">No ancillary services set, so nothing extra appears on the calculator. ' +
+  if (!blocks.length) return '<div class="muted">No specialist services set, so no extra tabs appear on the calculator.' +
     "Add an area to start, or load one from a fee guide.</div>";
 
   const areaSel = (it, i) => '<select class="w110" data-pe="item" data-i="' + i + '" data-f="area"' + ro + ">" +
@@ -7499,16 +7538,16 @@ function pricingSections(ro) {
           "waives its section's once-line when it is used, which is how an insurance-only engagement escapes the base SOA fee.</div>";
       } },
 
-    { key: "p-anc", title: "Ancillary services",
-      sub: "Coastal's other services — accounting, lending and the like",
+    { key: "p-anc", title: "Specialist services",
+      sub: "Coastal's specialist services — accounting, lending and the like",
       meta: anc.length + " service" + (anc.length === 1 ? "" : "s"),
       actions: ro ? "" : '<div class="no-print" style="margin-bottom:12px">' +
         '<button class="btn ghost btn-sm" data-peadd="ancArea">Add area</button> ' +
         '<button class="btn ghost btn-sm" id="btnAncLoad">Load services from a fee guide</button></div>',
       body: () => ancSettingsBody(p, anc, ro, del) +
         '<div class="spacer"></div><div class="small muted">These are services Coastal provides and bills for, quoted ' +
-        "alongside advice but priced on their own. Each <strong>area</strong> (Accounting, Lending) is its own block at the " +
-        "bottom of the calculator, with its <strong>sections</strong> as subheadings and its pricing notes underneath. " +
+        "alongside advice but priced on their own. Each <strong>area</strong> (Accounting, Lending) is its own tab on the " +
+        "calculator and prints its own report, with its <strong>sections</strong> as subheadings and its pricing notes underneath. " +
         "<strong>One-off</strong> and <strong>hourly</strong> are counted by the adviser; <strong>ongoing</strong> is charged " +
         "every year for as long as the service runs." +
         "<br><br><strong>Guide range</strong> is optional. With one set, the adviser can type their own fee on the calculator, " +
@@ -8503,6 +8542,7 @@ function wire() {
               toast("There is already an area called " + now + ".", "bad"); render(); return;
             }
             for (const it of p.items) if (it.section === ANCILLARY && String(it.area || "").trim() === was) it.area = now;
+            if (pricingInputs.tab === "area:" + was) pricingInputs.tab = "area:" + now;
             a.name = now;
           } else a[f] = v;
           break;
